@@ -1,0 +1,19 @@
+{
+  "name": "transit-tracker-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 4173"
+  },
+  "dependencies": {
+    "@deck.gl/core": "^9.0.38",
+    "@deck.gl/layers": "^9.0.38",
+    "@deck.gl/mesh-layers": "^9.0.38"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}

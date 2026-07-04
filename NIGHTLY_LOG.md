@@ -27,8 +27,25 @@ Mode: continuous through phases, skip-and-note on hard blockers, git commit at e
 - [x] `history/db.ts` — node:sqlite writer, rolling 7-day retention + scrub queries.
 - [x] `server/index.ts` — 30s poll loop + WebSocket fan-out + static geometry serving.
       VERIFIED: /health=264 vehicles, ws snapshot delivered, data served. ✓ **Backend complete.**
-- [ ] `web/` — Vite + MapLibre + deck.gl 3D scene with the reference visual system. NEXT (big chunk)
-- [ ] All NYC lines rendering + hover/click + search + scrub playback.
+- [~] `web/` — Vite + deck.gl 3D scene BUILT (908 modules, 0 errors). Backend serves it.
+      Glowing colored subway lines (real MTA colors), 3D train meshes, 60fps tween + correction
+      easing, WebSocket live feed, dual-canvas bloom, hover tooltips, glassmorphism HUD.
+      ⚠️ **NOT visually verified** — Chrome extension was offline in the autonomous session, so I
+      could not screenshot the live render. Build + serve verified; in-browser render is the #1
+      morning check. Hardened the known deck.gl v9 risks (SimpleMeshLayer texCoords, removed
+      uncertain Deck params). If something's off it'll be train mesh orientation/scale or a deck API detail.
+- [ ] Phase 2: all-lines polish, click-to-focus route highlight, search bar, scrub playback UI,
+      underground elevation, straight-line fallback, diff-based broadcast.
+
+## ▶ HOW TO VIEW IT (morning)
+```
+# from D:\train_tracker, with portable node on PATH:
+export PATH="/d/train_tracker/.tools/node-v24.18.0-win-x64:$PATH"   # (Git Bash)
+npm run server        # serves built app + live data on http://localhost:8080
+# then open http://localhost:8080 in Chrome
+# to rebuild the frontend after edits:  cd web && npm run build
+# for live-reload dev instead:          cd web && npm run dev   (app on :5173, backend must also run)
+```
 
 ## Refinements to revisit (noted, non-blocking)
 - Interpolation: some vehicles show speed 0 / next-stop `undefined` — vehicle-only entities
