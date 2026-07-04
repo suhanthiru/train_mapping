@@ -204,7 +204,7 @@ function busLayers() {
       getPosition: (d: Bus) => [d.lon, d.lat],
       getColor: (d: Bus) => d.color,
       getOrientation: (d: Bus) => [0, 90 - d.bearing, 0], // roll 0: flat on the road
-      sizeScale: 2.2, material: false, pickable: true,
+      sizeScale: 1.7, material: false, pickable: true,
       updateTriggers: { getPosition: performance.now(), getOrientation: performance.now() },
       parameters: { depthTest: true, depthMask: true }, // occluded by 3D buildings (no clipping through)
     }),

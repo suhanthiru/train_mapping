@@ -64,9 +64,10 @@ export function trainCarMesh(): Geometry {
   return boxMesh(11, 6.2, 4.4, 10.5); // half-len, floor half-w, roof half-w, height
 }
 
-// Short chamfered box — a bus. Long axis is +X (direction of travel).
+// A bus — proper proportions (long & narrow, clear forward direction).
+// half-len 6 (12m) x half-width 1.3 (2.6m) x height 3.2m — real bus ratio.
 export function busMesh(): Geometry {
-  return boxMesh(7, 2.4, 1.9, 3.4);
+  return boxMesh(6, 1.3, 1.05, 3.2);
 }
 
 // Chamfered box (trapezoidal cross-section: wider floor, narrower roof).
