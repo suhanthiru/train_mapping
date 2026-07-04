@@ -12,7 +12,10 @@
         font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
         color: rgba(150, 235, 255, 0.85);
       }
-      #deck-canvas { position: absolute; inset: 0; background: #000103; }
+      #map { position: absolute; inset: 0; background: #000103; }
+      #map .maplibregl-ctrl-attrib { background: rgba(0,0,0,0.4); }
+      #map .maplibregl-ctrl-attrib a { color: rgba(120,200,220,0.6); }
+      .maplibregl-canvas { outline: none; }
       /* dual-canvas bloom overlay (reference technique): screen-blend a blurred copy */
       #bloom-canvas {
         position: absolute; inset: 0; width: 100%; height: 100%;
@@ -53,7 +56,7 @@
   </head>
   <body>
     <div id="app">
-      <canvas id="deck-canvas"></canvas>
+      <div id="map"></div>
       <canvas id="bloom-canvas"></canvas>
     </div>
     <div id="stat" class="panel">connecting…</div>
