@@ -1,61 +1,59 @@
-// Procedural low-poly "model railway" train mesh — an elongated box with a
-// tapered nose. Units are meters; SimpleMeshLayer scales via sizeScale.
-// Returns a luma.gl Geometry (deck.gl v9 SimpleMeshLayer wants a Geometry,
-// not a raw {positions,...} object). Non-indexed (each face has its own verts).
+// Procedural "model railway" subway train: several chamfered cars in a row
+// (trapezoidal cross-section — wider at the floor, narrower roof — reads as a
+// train, not a box). Units are meters; SimpleMeshLayer scales via sizeScale.
+// Returns a luma.gl Geometry (deck.gl v9 wants a Geometry, not a raw object).
 
 import { Geometry } from "@luma.gl/engine";
 
 export function trainMesh(): Geometry {
-  const L = 90; // half-length ~180m
-  const W = 7; // half-width
-  const H = 6; // half-height
-  const nose = 30;
+  const CARS = 6;
+  const carLen = 22;
+  const gap = 3;
+  const W = 6.5; // half floor width
+  const Wt = 4.2; // half roof width
+  const H = 11; // height
+  const total = CARS * carLen + (CARS - 1) * gap;
+  const x0 = -total / 2;
 
-  const v: number[][] = [
-    [-L, -W, -H], [-L, W, -H], [-L, W, H], [-L, -W, H],
-    [L - nose, -W, -H], [L - nose, W, -H], [L - nose, W, H], [L - nose, -W, H],
-    [L, -W * 0.5, 0], [L, W * 0.5, 0],
-  ];
+  const pos: number[] = [];
+  const nor: number[] = [];
+  const uv: number[] = [];
 
-  const faces: number[][] = [
-    [0, 1, 2], [0, 2, 3],
-    [0, 4, 5], [0, 5, 1],
-    [3, 2, 6], [3, 6, 7],
-    [1, 5, 6], [1, 6, 2],
-    [0, 3, 7], [0, 7, 4],
-    [4, 7, 8], [7, 9, 8], [4, 8, 9], [4, 9, 5],
-    [5, 9, 6], [6, 9, 7],
-  ];
-
-  const n = faces.length * 3;
-  const positions = new Float32Array(n * 3);
-  const normals = new Float32Array(n * 3);
-  const texCoords = new Float32Array(n * 2);
-  let p = 0;
-  let t = 0;
-  for (const f of faces) {
-    const a = v[f[0]], b = v[f[1]], c = v[f[2]];
+  const tri = (a: number[], b: number[], c: number[]) => {
     const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
     const wx = c[0] - a[0], wy = c[1] - a[1], wz = c[2] - a[2];
-    let nx = uy * wz - uz * wy;
-    let ny = uz * wx - ux * wz;
-    let nz = ux * wy - uy * wx;
-    const len = Math.hypot(nx, ny, nz) || 1;
-    nx /= len; ny /= len; nz /= len;
-    for (const vert of [a, b, c]) {
-      positions[p] = vert[0]; positions[p + 1] = vert[1]; positions[p + 2] = vert[2];
-      normals[p] = nx; normals[p + 1] = ny; normals[p + 2] = nz;
-      texCoords[t] = 0; texCoords[t + 1] = 0;
-      p += 3; t += 2;
-    }
+    let nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+    const l = Math.hypot(nx, ny, nz) || 1;
+    nx /= l; ny /= l; nz /= l;
+    for (const v of [a, b, c]) { pos.push(v[0], v[1], v[2]); nor.push(nx, ny, nz); uv.push(0, 0); }
+  };
+  const quad = (a: number[], b: number[], c: number[], d: number[]) => { tri(a, b, c); tri(a, c, d); };
+
+  for (let i = 0; i < CARS; i++) {
+    const ax = x0 + i * (carLen + gap);
+    const bx = ax + carLen;
+    // slight nose taper on the first/last car ends
+    const frontCab = i === CARS - 1 ? 4 : 0;
+    const backCab = i === 0 ? 4 : 0;
+    // 8 corners: floor (W) and roof (Wt)
+    const fbl = [ax + backCab, -W, 0], fbr = [ax + backCab, W, 0];
+    const nbl = [bx - frontCab, -W, 0], nbr = [bx - frontCab, W, 0];
+    const ftl = [ax + backCab, -Wt, H], ftr = [ax + backCab, Wt, H];
+    const ntl = [bx - frontCab, -Wt, H], ntr = [bx - frontCab, Wt, H];
+    quad(fbl, fbr, nbr, nbl);       // floor
+    quad(ftl, ntl, ntr, ftr);       // roof
+    quad(fbl, nbl, ntl, ftl);       // left side
+    quad(fbr, ftr, ntr, nbr);       // right side
+    quad(fbl, ftl, ftr, fbr);       // back end
+    quad(nbl, nbr, ntr, ntl);       // front end
   }
 
   return new Geometry({
     topology: "triangle-list",
     attributes: {
-      positions: { size: 3, value: positions },
-      normals: { size: 3, value: normals },
-      texCoords: { size: 2, value: texCoords },
+      positions: { size: 3, value: new Float32Array(pos) },
+      normals: { size: 3, value: new Float32Array(nor) },
+      texCoords: { size: 2, value: new Float32Array(uv) },
     },
   });
 }

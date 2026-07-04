@@ -11,10 +11,11 @@ import { WebSocketServer, WebSocket } from "ws";
 import { fetchNycVehicles } from "../ingest/nyc.ts";
 import { Interpolator, loadStatic } from "../core/interpolate.ts";
 import { History } from "../history/db.ts";
-import type { VehicleState } from "../shared/types.ts";
+import type { VehicleState, RawVehicle } from "../shared/types.ts";
 
 const PORT = Number(process.env.PORT ?? 8080);
-const POLL_MS = 30_000;
+const POLL_MS = 30_000; // how often we hit the live feed
+const PUSH_MS = 4_000; // how often we re-interpolate + broadcast fresh positions
 const ROOT = process.cwd();
 const DATA_DIR = join(ROOT, "data");
 const WEB_DIST = join(ROOT, "web", "dist");
@@ -33,18 +34,25 @@ const interp = new Interpolator(stat);
 const history = new History(join(DATA_DIR, "history.db"));
 
 let latest: VehicleState[] = [];
+let lastRaws: RawVehicle[] = [];
 
-async function tick() {
+// Poll the live feed (slow): refresh predictions + record history.
+async function fetchTick() {
   try {
-    const raws = await fetchNycVehicles();
+    lastRaws = await fetchNycVehicles();
     const now = Math.floor(Date.now() / 1000);
-    latest = interp.update(raws, now);
-    history.record(now, latest);
-    broadcast({ type: "state", city: "nyc", ts: now, vehicles: latest });
-    console.log(`[server] tick: ${latest.length} vehicles -> ${wss.clients.size} clients`);
+    history.record(now, interp.update(lastRaws, now));
+    console.log(`[server] feed: ${lastRaws.length} raw -> ${wss.clients.size} clients`);
   } catch (e) {
-    console.error("[server] tick error:", (e as Error).message);
+    console.error("[server] feed error:", (e as Error).message);
   }
+}
+
+// Re-interpolate cached predictions with a fresh clock (fast) + broadcast.
+function pushTick() {
+  const now = Math.floor(Date.now() / 1000);
+  latest = interp.update(lastRaws, now);
+  broadcast({ type: "state", city: "nyc", ts: now, vehicles: latest });
 }
 
 // --- HTTP: static geometry + built frontend ---
@@ -93,8 +101,9 @@ function broadcast(msg: unknown) {
 
 server.listen(PORT, () => {
   console.log(`[server] http+ws on :${PORT}  (data + ws)`);
-  tick(); // fetch immediately so the first client gets data fast
-  setInterval(tick, POLL_MS);
+  fetchTick().then(pushTick); // fetch immediately, then push so first client gets data fast
+  setInterval(fetchTick, POLL_MS);
+  setInterval(pushTick, PUSH_MS);
   setInterval(() => {
     const removed = history.prune();
     if (removed) console.log(`[server] pruned ${removed} old history rows`);

@@ -14,13 +14,13 @@ import { trainMesh } from "./mesh.ts";
 const HOST = location.hostname || "localhost";
 const HTTP = `http://${HOST}:8080`;
 const WS = `ws://${HOST}:8080`;
-const SPEED_BOOST = 5; // exaggerate real m/s so motion is visible at city zoom
+const SPEED_BOOST = 1.5; // mild exaggeration for liveliness; motion stays ~accurate
 
 interface RouteInfo { id: string; color: string; textColor: string; shortName: string }
 interface Stop { id: string; name: string; pos: [number, number] }
 interface Vehicle {
   id: string; shapeId: string;
-  dist: number; targetDist: number; speed: number;
+  dist: number; correct: number; speed: number; // correct = pending drift to absorb
   color: [number, number, number];
   route: string; nextStopName?: string;
   position: [number, number, number]; angle: number;
@@ -99,9 +99,10 @@ map.on("style.load", () => {
 let linePaths: { path: [number, number][]; color: [number, number, number] }[] = [];
 let stationPts: Stop[] = [];
 
-function layers() {
-  const data = [...vehicles.values()];
-  return [
+// static layers (subway network + stations) — built once, never rebuilt per frame
+let staticLayers: any[] = [];
+function buildStatic() {
+  staticLayers = [
     new PathLayer({
       id: "lines", data: linePaths,
       getPath: (d: any) => d.path, getColor: (d: any) => [...d.color, 200],
@@ -113,11 +114,19 @@ function layers() {
       getPosition: (d: any) => d.pos, getFillColor: [150, 220, 255, 110],
       getRadius: 24, radiusMinPixels: 1, radiusMaxPixels: 4, parameters: { depthTest: false },
     }),
+  ];
+}
+
+// dynamic train layers — rebuilt each frame with fresh positions
+function trainLayers() {
+  const data = [...vehicles.values()];
+  return [
     new ScatterplotLayer({
       id: "train-glow", data,
       getPosition: (d: Vehicle) => d.position,
       getFillColor: (d: Vehicle) => [...d.color, 235] as [number, number, number, number],
       getRadius: 45, radiusMinPixels: 3, radiusMaxPixels: 11, pickable: true,
+      updateTriggers: { getPosition: performance.now() },
       parameters: { depthTest: false },
     }),
     new SimpleMeshLayer({
@@ -125,13 +134,14 @@ function layers() {
       getPosition: (d: Vehicle) => d.position,
       getColor: (d: Vehicle) => d.color,
       getOrientation: (d: Vehicle) => [0, 90 - d.angle, 90],
-      sizeScale: 1.6, pickable: true, material: false,
+      sizeScale: 1.4, pickable: true, material: false,
+      updateTriggers: { getPosition: performance.now(), getOrientation: performance.now() },
       parameters: { depthTest: false },
     }),
   ];
 }
 
-function updateLayers() { overlay.setProps({ layers: layers() }); }
+function updateLayers() { overlay.setProps({ layers: [...staticLayers, ...trainLayers()] }); }
 
 // --- animation: dead-reckon anchor forward (boosted) + ease render toward it ---
 let lastT = performance.now();
@@ -139,14 +149,18 @@ function frame(now: number) {
   try {
     const dt = Math.min(0.1, (now - lastT) / 1000);
     lastT = now;
-    const k = 1 - Math.exp(-dt / 0.4);
     for (const v of vehicles.values()) {
       try {
         const shape = shapes[v.shapeId];
         if (!shape || !shape.cum?.length) continue;
         const total = shape.cum[shape.cum.length - 1];
-        v.targetDist = Math.max(0, Math.min(total, v.targetDist + v.speed * SPEED_BOOST * dt));
-        v.dist += (v.targetDist - v.dist) * k;
+        v.dist += v.speed * SPEED_BOOST * dt; // continuous glide, never freezes mid-track
+        if (v.correct) {
+          const step = v.correct * Math.min(1, dt / 1.2); // absorb drift over ~1.2s
+          v.dist += step; v.correct -= step;
+        }
+        if (v.dist > total) v.dist = total;
+        else if (v.dist < 0) v.dist = 0;
         const [lon, lat] = distToLonLat(shape, v.dist);
         v.position = [lon, lat, 0];
         v.angle = bearingAt(shape, v.dist);
@@ -199,10 +213,13 @@ function applyState(list: any[]) {
     seen.add(s.id);
     const ex = vehicles.get(s.id);
     if (ex) {
-      ex.targetDist = s.dist; ex.speed = s.speed; ex.route = s.route; ex.nextStopName = s.nextStopName;
+      ex.speed = s.speed; ex.route = s.route; ex.nextStopName = s.nextStopName;
+      const drift = s.dist - ex.dist;
+      if (Math.abs(drift) > 1500) { ex.dist = s.dist; ex.correct = 0; } // big desync: snap
+      else ex.correct = drift; // otherwise absorb smoothly in frame()
     } else {
       vehicles.set(s.id, {
-        id: s.id, shapeId: s.shapeId, dist: s.dist, targetDist: s.dist, speed: s.speed,
+        id: s.id, shapeId: s.shapeId, dist: s.dist, correct: 0, speed: s.speed,
         color: hex2rgb(s.color), route: s.route, nextStopName: s.nextStopName,
         position: [...distToLonLat(shapes[s.shapeId], s.dist), 0] as [number, number, number],
         angle: bearingAt(shapes[s.shapeId], s.dist),
@@ -240,6 +257,7 @@ async function main() {
   shapes = sh; routes = ro;
   linePaths = Object.values(shapes).map((s) => ({ path: s.pts, color: shapeColor(s.id) }));
   stationPts = (Object.values(st) as Stop[]).filter((s) => s.pos && s.pos[0]);
+  buildStatic();
   console.log(`[init] ${linePaths.length} lines, ${stationPts.length} stations`);
   connect();
   requestAnimationFrame(frame);

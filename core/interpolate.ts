@@ -93,6 +93,14 @@ export class Interpolator {
     return null;
   }
 
+  /** distance of the first stop after a given distance. */
+  private nextStopDist(shapeId: string, dist: number): number | null {
+    const list = this.s.shapeStops[shapeId];
+    if (!list) return null;
+    for (const e of list) if (e.dist > dist + 30) return e.dist;
+    return null;
+  }
+
   update(raws: RawVehicle[], now = Math.floor(Date.now() / 1000)): VehicleState[] {
     const out: VehicleState[] = [];
     for (const v of raws) {
@@ -103,29 +111,33 @@ export class Interpolator {
 
       let dist: number;
       let speed = 0;
-
+      const age = Math.max(0, now - v.feedTimestamp); // seconds since this feed
       const toDist = v.toStopId ? this.stopDist(shapeId, v.toStopId) : null;
       const atDist = v.atStopId ? this.stopDist(shapeId, v.atStopId) : null;
 
-      if (v.currentStatus === "STOPPED_AT" && atDist != null) {
-        dist = atDist; // genuinely dwelling at a station
-      } else if (toDist != null) {
+      if (toDist != null && v.arriveTime && v.arriveTime > now && v.currentStatus !== "STOPPED_AT") {
+        // in transit with a live future arrival — pace to arrive on time
         const fromDist =
           (v.fromStopId ? this.stopDist(shapeId, v.fromStopId) : null) ??
-          this.prevStopDist(shapeId, toDist) ??
-          toDist - DEFAULT_SEGMENT;
+          this.prevStopDist(shapeId, toDist) ?? toDist - DEFAULT_SEGMENT;
         const segLen = Math.max(1, toDist - fromDist);
         const travelTime = segLen / TYPICAL_SPEED;
-        if (v.arriveTime && v.arriveTime > now) {
-          const departTime = v.arriveTime - travelTime;
-          const frac = Math.max(0, Math.min(1, (now - departTime) / travelTime));
-          dist = fromDist + frac * segLen;
-          speed = Math.max(0, (toDist - dist) / (v.arriveTime - now));
-        } else {
-          // running late / no live ETA: creep toward the stop, don't park dead
-          dist = fromDist + 0.9 * segLen;
-          speed = TYPICAL_SPEED * 0.3;
-        }
+        const departTime = v.arriveTime - travelTime;
+        const frac = Math.max(0, Math.min(1, (now - departTime) / travelTime));
+        dist = fromDist + frac * segLen;
+        speed = Math.min(25, Math.max(2, (toDist - dist) / (v.arriveTime - now)));
+      } else if (v.currentStatus === "STOPPED_AT" && atDist != null) {
+        // at a station: brief dwell, then glide toward the next stop (feed-anchored,
+        // so position advances at exactly `speed` — consistent, no jitter)
+        const nextD = this.nextStopDist(shapeId, atDist) ?? atDist + DEFAULT_SEGMENT;
+        dist = Math.min(nextD, atDist + TYPICAL_SPEED * 0.7 * Math.max(0, age - 4));
+        speed = dist < nextD - 5 ? TYPICAL_SPEED * 0.7 : 0;
+      } else if (toDist != null) {
+        // late / no live ETA but heading to a stop: glide toward it (feed-anchored)
+        const fromDist = this.prevStopDist(shapeId, toDist) ?? toDist - DEFAULT_SEGMENT;
+        const start = fromDist + 0.4 * (toDist - fromDist);
+        dist = Math.min(toDist, start + TYPICAL_SPEED * age);
+        speed = dist < toDist - 5 ? TYPICAL_SPEED : 0;
       } else if (atDist != null) {
         dist = atDist; // only know which stop it's near
       } else {
