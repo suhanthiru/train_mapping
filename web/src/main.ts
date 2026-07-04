@@ -45,13 +45,16 @@ const tipEl = document.getElementById("tooltip")!;
 
 // --- live calibration/diagnostics (temporary): press 1-4 to cycle bus yaw
 // formulas, B to toggle 3D buildings, G to toggle bloom. FPS shown in the HUD.
-let busYawMode = 0;
-const busYaw = (b: number) => [90 - b, b - 90, -b, b][busYawMode];
+// Mode 4 (yaw = bearing) verified correct by user calibration — OBA publishes
+// math-convention bearings (CCW from east), not GTFS-spec compass degrees.
+// Key 5 = mode 4 flipped 180° in case noses read backward.
+let busYawMode = 3;
+const busYaw = (b: number) => [90 - b, b - 90, -b, b, b + 180][busYawMode];
 let bloomOn = true;
 let statBase = "connecting…";
 let fpsCount = 0, fpsLast = performance.now(), fpsVal = 0;
 window.addEventListener("keydown", (e) => {
-  if (e.key >= "1" && e.key <= "4") { busYawMode = +e.key - 1; console.log("[cal] bus yaw mode", e.key); }
+  if (e.key >= "1" && e.key <= "5") { busYawMode = +e.key - 1; console.log("[cal] bus yaw mode", e.key); }
   else if (e.key === "b" || e.key === "B") {
     const vis = map.getLayoutProperty("buildings", "visibility");
     map.setLayoutProperty("buildings", "visibility", vis === "none" ? "visible" : "none");
@@ -319,10 +322,14 @@ const bctx = bloom.getContext("2d");
 function drawBloom() {
   if (!bctx) return;
   try {
+    // Quarter-resolution backing buffer: the CSS blur completely hides the
+    // downscale, and the copy + filter get ~16x cheaper. Look is unchanged.
     const src = map.getCanvas();
-    if (bloom.width !== src.width) { bloom.width = src.width; bloom.height = src.height; }
-    bctx.clearRect(0, 0, bloom.width, bloom.height);
-    bctx.drawImage(src, 0, 0);
+    const bw = Math.max(1, src.width >> 2);
+    const bh = Math.max(1, src.height >> 2);
+    if (bloom.width !== bw || bloom.height !== bh) { bloom.width = bw; bloom.height = bh; }
+    bctx.clearRect(0, 0, bw, bh);
+    bctx.drawImage(src, 0, 0, bw, bh);
   } catch { /* ignore */ }
 }
 
