@@ -98,46 +98,70 @@ function buildStationLayer(stops: Record<string, Stop>) {
   });
 }
 
-function trainLayer() {
-  return new SimpleMeshLayer({
-    id: "trains",
-    data: [...vehicles.values()],
-    mesh: MESH as any,
-    getPosition: (d: Vehicle) => d.position,
-    getColor: (d: Vehicle) => d.color,
-    getOrientation: (d: Vehicle) => [0, 90 - d.angle, 90],
-    sizeScale: 2.4,
-    pickable: true,
-    material: { ambient: 0.7, diffuse: 0.6, shininess: 40 },
-    parameters: { depthTest: true },
-  });
+function trainLayers() {
+  const data = [...vehicles.values()];
+  return [
+    // guaranteed-visible glowing dot under each train (bloom picks this up)
+    new ScatterplotLayer({
+      id: "train-glow",
+      data,
+      getPosition: (d: Vehicle) => d.position,
+      getFillColor: (d: Vehicle) => [...d.color, 235] as [number, number, number, number],
+      getRadius: 55,
+      radiusMinPixels: 3,
+      radiusMaxPixels: 12,
+      pickable: true,
+      parameters: { depthTest: false },
+    }),
+    // 3D model train, unlit flat color (like the reference — reads as "glowing")
+    new SimpleMeshLayer({
+      id: "trains",
+      data,
+      mesh: MESH as any,
+      getPosition: (d: Vehicle) => d.position,
+      getColor: (d: Vehicle) => d.color,
+      getOrientation: (d: Vehicle) => [0, 90 - d.angle, 90],
+      sizeScale: 3,
+      pickable: true,
+      material: false, // unlit: full bright color, visible on the dark scene
+      parameters: { depthTest: false },
+    }),
+  ];
 }
 
 function render() {
   deck.setProps({
-    layers: [...buildStaticLayers(), stationLayer, trainLayer()].filter(Boolean),
+    layers: [...buildStaticLayers(), stationLayer, ...trainLayers()].filter(Boolean),
   });
 }
 
 // --- animation: dead-reckon the anchor forward + ease render toward it ---
+// Fully guarded: a bad vehicle must never kill the loop (that would freeze the scene).
 let lastT = performance.now();
 function frame(now: number) {
-  const dt = Math.min(0.1, (now - lastT) / 1000);
-  lastT = now;
-  const k = 1 - Math.exp(-dt / 0.4); // correction easing time-constant
-  for (const v of vehicles.values()) {
-    const shape = shapes[v.shapeId];
-    if (!shape) continue;
-    const total = shape.cum[shape.cum.length - 1];
-    v.targetDist = Math.max(0, Math.min(total, v.targetDist + v.speed * dt));
-    v.dist += (v.targetDist - v.dist) * k;
-    const [lon, lat] = distToLonLat(shape, v.dist);
-    v.position = [lon, lat, 0];
-    v.angle = bearingAt(shape, v.dist);
+  try {
+    const dt = Math.min(0.1, (now - lastT) / 1000);
+    lastT = now;
+    const k = 1 - Math.exp(-dt / 0.4); // correction easing time-constant
+    for (const v of vehicles.values()) {
+      try {
+        const shape = shapes[v.shapeId];
+        if (!shape || !shape.cum?.length) continue;
+        const total = shape.cum[shape.cum.length - 1];
+        v.targetDist = Math.max(0, Math.min(total, v.targetDist + v.speed * dt));
+        v.dist += (v.targetDist - v.dist) * k;
+        const [lon, lat] = distToLonLat(shape, v.dist);
+        v.position = [lon, lat, 0];
+        v.angle = bearingAt(shape, v.dist);
+      } catch { /* skip a bad vehicle, keep the loop alive */ }
+    }
+    render();
+    drawBloom();
+  } catch (e) {
+    console.error("[frame] error (loop continues):", e);
+  } finally {
+    requestAnimationFrame(frame); // ALWAYS re-arm
   }
-  render();
-  drawBloom();
-  requestAnimationFrame(frame);
 }
 
 // --- dual-canvas bloom (reference technique), defensive ---
@@ -191,16 +215,28 @@ function applyState(list: any[]) {
   }
   for (const id of [...vehicles.keys()]) if (!seen.has(id)) vehicles.delete(id);
   statEl.textContent = `${vehicles.size} trains live · NYC subway`;
+  (window as any).__tt = { vehicles, shapes, routes, deck };
 }
 
+let loggedFirst = false;
 function connect() {
   const ws = new WebSocket(WS);
+  ws.onopen = () => console.log("[ws] connected to", WS);
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
-    if (m.type === "snapshot" || m.type === "state") applyState(m.vehicles ?? []);
+    if (m.type === "snapshot" || m.type === "state") {
+      applyState(m.vehicles ?? []);
+      if (!loggedFirst) {
+        loggedFirst = true;
+        const sample = [...vehicles.values()][0];
+        console.log(`[ws] ${m.type}: ${m.vehicles?.length ?? 0} raw -> ${vehicles.size} rendered`);
+        if (sample) console.log("[ws] sample train:", sample.route, "at", sample.position, "speed", sample.speed);
+        else console.warn("[ws] 0 trains matched a loaded shape — check shapes.json vs feed shapeIds");
+      }
+    }
   };
   ws.onclose = () => { statEl.textContent = "reconnecting…"; setTimeout(connect, 2000); };
-  ws.onerror = () => ws.close();
+  ws.onerror = (err) => { console.error("[ws] error", err); ws.close(); };
 }
 
 async function main() {
