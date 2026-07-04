@@ -81,10 +81,11 @@ function boxMesh(L: number, W: number, Wt: number, H: number): Geometry {
     for (const v of [a, b, c]) { pos.push(v[0], v[1], v[2]); nor.push(nx, ny, nz); uv.push(0, 0); }
   };
   const quad = (a: number[], b: number[], c: number[], d: number[]) => { tri(a, b, c); tri(a, c, d); };
-  // Y is UP (deck.gl SimpleMeshLayer convention): height along +Y, length along X,
-  // width along Z. Building it Z-up made the heading rotation bank the mesh sideways.
-  const fbl = [-L, 0, -W], fbr = [-L, 0, W], nbl = [L, 0, -W], nbr = [L, 0, W];
-  const ftl = [-L, H, -Wt], ftr = [-L, H, Wt], ntl = [L, H, -Wt], ntr = [L, H, Wt];
+  // Z is UP. Verified against deck.gl source (mesh-layers/utils/matrix.js):
+  // with orientation [0, yaw, 0], model Z maps to world up (0,0,1) and model X
+  // yaws in the horizontal east/north plane — so height goes on +Z, length on X.
+  const fbl = [-L, -W, 0], fbr = [-L, W, 0], nbl = [L, -W, 0], nbr = [L, W, 0];
+  const ftl = [-L, -Wt, H], ftr = [-L, Wt, H], ntl = [L, -Wt, H], ntr = [L, Wt, H];
   quad(fbl, fbr, nbr, nbl); quad(ftl, ntl, ntr, ftr);
   quad(fbl, nbl, ntl, ftl); quad(fbr, ftr, ntr, nbr);
   quad(fbl, ftl, ftr, fbr); quad(nbl, nbr, ntr, ntl);

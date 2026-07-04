@@ -52,8 +52,9 @@ export async function fetchNycBuses(): Promise<VehicleState[]> {
   } catch (e) {
     console.error("[nyc-bus] error:", (e as Error).message);
   }
-  // Cap for constant framerate (user pref). Full fleet can be ~2k+ buses.
-  return out.slice(0, 250);
+  // Effectively the full fleet — count wasn't the lag source (data churn was;
+  // fixed client-side by throttling layer rebuilds). Safety cap only.
+  return out.slice(0, 2000);
 }
 
 const isMain =

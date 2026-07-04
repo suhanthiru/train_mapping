@@ -38,8 +38,8 @@ interface Bus { id: string; lon: number; lat: number; tLon: number; tLat: number
 const buses = new Map<string, Bus>();
 const CAR_MESH = trainCarMesh();
 const BUS_MESH = busMesh();
-const CARS_PER_TRAIN = 3;
-const CAR_SPACING = 30; // meters between subway car centers along the track
+const CARS_PER_TRAIN = 5;
+const CAR_SPACING = 26; // meters between subway car centers along the track
 const statEl = document.getElementById("stat")!;
 const tipEl = document.getElementById("tooltip")!;
 
@@ -247,10 +247,8 @@ function updateLayers() { overlay.setProps({ layers: [...staticLayers, ...trainL
 
 // --- animation: dead-reckon anchor forward (boosted) + ease render toward it ---
 let lastT = performance.now();
-let bloomFrame = 0;
-let renderTick = 0;
+let lastLayerPush = 0;
 function frame(now: number) {
-  if (++renderTick % 2 === 1) { requestAnimationFrame(frame); return; } // cap render ~30fps
   try {
     const dt = Math.min(0.1, (now - lastT) / 1000);
     lastT = now;
@@ -276,8 +274,14 @@ function frame(now: number) {
       b.lon += (b.tLon - b.lon) * k;
       b.lat += (b.tLat - b.lat) * k;
     }
-    updateLayers();
-    if (++bloomFrame % 2 === 0) drawBloom(); // throttle the full-canvas bloom copy
+    // integrate every frame (cheap math), but push layer data ~10Hz — rebuilding
+    // deck layers + re-uploading instance attributes every frame was the real
+    // lag source (data churn), not vehicle count / GPU.
+    if (now - lastLayerPush > 100) {
+      lastLayerPush = now;
+      updateLayers();
+      drawBloom();
+    }
   } catch (e) {
     console.error("[frame] error (loop continues):", e);
   } finally {
@@ -347,10 +351,11 @@ function applyState(list: any[]) {
     seen.add(s.id);
     const ex = vehicles.get(s.id);
     if (ex) {
-      ex.speed = s.speed; ex.route = s.route; ex.nextStopName = s.nextStopName;
+      ex.route = s.route; ex.nextStopName = s.nextStopName;
       const drift = s.dist - ex.dist;
-      if (Math.abs(drift) > 1500) { ex.dist = s.dist; ex.correct = 0; } // big desync: snap
-      else ex.correct = drift; // otherwise absorb smoothly in frame()
+      if (Math.abs(drift) > 1500) { ex.dist = s.dist; ex.correct = 0; ex.speed = s.speed; } // big desync: snap
+      else if (drift >= 0) { ex.correct = drift; ex.speed = s.speed; } // behind truth: catch up smoothly
+      else { ex.correct = 0; ex.speed = 0; } // ahead of truth: HOLD (trains never move backward)
     } else {
       vehicles.set(s.id, {
         id: s.id, shapeId: s.shapeId, dist: s.dist, correct: 0, speed: s.speed,
