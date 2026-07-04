@@ -34,7 +34,7 @@ const hex2rgb = (h: string): [number, number, number] => {
 let shapes: Record<string, Shape> = {};
 let routes: Record<string, RouteInfo> = {};
 const vehicles = new Map<string, Vehicle>();
-interface Bus { id: string; lon: number; lat: number; tLon: number; tLat: number; bearing: number; speed: number; route: string; color: [number, number, number]; }
+interface Bus { id: string; lon: number; lat: number; tLon: number; tLat: number; heading: number; speed: number; route: string; color: [number, number, number]; }
 const buses = new Map<string, Bus>();
 const CAR_MESH = trainCarMesh();
 const BUS_MESH = busMesh();
@@ -43,25 +43,25 @@ const CAR_SPACING = 26; // meters between subway car centers along the track
 const statEl = document.getElementById("stat")!;
 const tipEl = document.getElementById("tooltip")!;
 
-// --- live calibration/diagnostics (temporary): press 1-4 to cycle bus yaw
-// formulas, B to toggle 3D buildings, G to toggle bloom. FPS shown in the HUD.
-// Mode 4 (yaw = bearing) verified correct by user calibration — OBA publishes
-// math-convention bearings (CCW from east), not GTFS-spec compass degrees.
-// Key 5 = mode 4 flipped 180° in case noses read backward.
-let busYawMode = 3;
-const busYaw = (b: number) => [90 - b, b - 90, -b, b, b + 180][busYawMode];
+// --- perf diagnostics: B buildings, G bloom, T trains, V buses, P pause data
+// pushes (map stays interactive). FPS shown in the HUD.
 let bloomOn = true;
+let showTrains = true;
+let showBuses = true;
+let pausePush = false;
 let statBase = "connecting…";
 let fpsCount = 0, fpsLast = performance.now(), fpsVal = 0;
 window.addEventListener("keydown", (e) => {
-  if (e.key >= "1" && e.key <= "5") { busYawMode = +e.key - 1; console.log("[cal] bus yaw mode", e.key); }
-  else if (e.key === "b" || e.key === "B") {
+  const k = e.key.toLowerCase();
+  if (k === "b") {
     const vis = map.getLayoutProperty("buildings", "visibility");
     map.setLayoutProperty("buildings", "visibility", vis === "none" ? "visible" : "none");
-  } else if (e.key === "g" || e.key === "G") {
+  } else if (k === "g") {
     bloomOn = !bloomOn;
     (document.getElementById("bloom-canvas") as HTMLCanvasElement).style.display = bloomOn ? "" : "none";
-  }
+  } else if (k === "t") showTrains = !showTrains;
+  else if (k === "v") showBuses = !showBuses;
+  else if (k === "p") pausePush = !pausePush;
 });
 
 const routeOfShape = (id: string) => id.split("..")[0];
@@ -108,7 +108,8 @@ const map = new maplibregl.Map({
   zoom: 13,
   pitch: 58,
   bearing: 18,
-  antialias: true,
+  antialias: false, // deck AA's its own layers; extrusion AA is brutal on integrated GPUs
+  pixelRatio: Math.min(window.devicePixelRatio || 1, 1.25), // cap fill-rate on high-DPI displays
   maxPitch: 75,
 });
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
@@ -208,6 +209,7 @@ function buildStatic() {
 // the track shape, so it articulates around curves. Rebuilt each frame.
 interface Car { position: [number, number]; angle: number; color: [number, number, number]; v: Vehicle; }
 function trainLayers() {
+  if (!showTrains) return [];
   const heads = [...vehicles.values()];
   const cars: Car[] = [];
   for (const v of heads) {
@@ -242,6 +244,7 @@ function trainLayers() {
 }
 
 function busLayers() {
+  if (!showBuses) return [];
   const data = [...buses.values()];
   return [
     new ScatterplotLayer({
@@ -256,7 +259,7 @@ function busLayers() {
       id: "buses", data, mesh: BUS_MESH as any,
       getPosition: (d: Bus) => [d.lon, d.lat],
       getColor: (d: Bus) => d.color,
-      getOrientation: (d: Bus) => [0, busYaw(d.bearing), 0], // yaw formula selectable via keys 1-4
+      getOrientation: (d: Bus) => [0, 90 - d.heading, 0], // movement-derived compass heading, same formula as trains
       sizeScale: 1.7, material: false, pickable: true,
       updateTriggers: { getPosition: performance.now(), getOrientation: performance.now() },
       parameters: { depthTest: true, depthMask: true }, // occluded by 3D buildings (no clipping through)
@@ -298,7 +301,7 @@ function frame(now: number) {
     // integrate every frame (cheap math), but push layer data ~10Hz — rebuilding
     // deck layers + re-uploading instance attributes every frame was the real
     // lag source (data churn), not vehicle count / GPU.
-    if (now - lastLayerPush > 100) {
+    if (!pausePush && now - lastLayerPush > 100) {
       lastLayerPush = now;
       updateLayers();
       if (bloomOn) drawBloom();
@@ -307,7 +310,7 @@ function frame(now: number) {
     if (now - fpsLast > 500) {
       fpsVal = Math.round((fpsCount * 1000) / (now - fpsLast));
       fpsCount = 0; fpsLast = now;
-      statEl.textContent = `${statBase} · ${fpsVal} fps · bus-dir ${busYawMode + 1} [1-4] · [B]ldgs [G]low`;
+      statEl.textContent = `${statBase} · ${fpsVal} fps · [B]ldg [G]low [T]rain [V]bus [P]ause`;
     }
   } catch (e) {
     console.error("[frame] error (loop continues):", e);
@@ -368,13 +371,19 @@ function applyState(list: any[]) {
       busSeen.add(s.id);
       const eb = buses.get(s.id);
       if (eb) {
+        // Heading from actual GPS movement (unambiguous, compass convention) —
+        // the feed's bearing field is stale/junk when buses idle at stops.
+        const mx = (s.pos[0] - eb.tLon) * 111320 * Math.cos((s.pos[1] * Math.PI) / 180);
+        const my = (s.pos[1] - eb.tLat) * 111320;
+        if (Math.hypot(mx, my) > 15) eb.heading = ((Math.atan2(mx, my) * 180) / Math.PI + 360) % 360;
         // ease toward the reported GPS (which is on the road); don't dead-reckon
         // along heading — that cuts across curves and drifts off the street
         eb.tLon = s.pos[0]; eb.tLat = s.pos[1];
-        eb.bearing = s.bearing ?? eb.bearing; eb.speed = s.speed ?? eb.speed;
+        eb.speed = s.speed ?? eb.speed;
         if (Math.abs(eb.tLon - eb.lon) > 0.02 || Math.abs(eb.tLat - eb.lat) > 0.02) { eb.lon = eb.tLon; eb.lat = eb.tLat; } // snap big jumps
       } else {
-        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], tLon: s.pos[0], tLat: s.pos[1], bearing: s.bearing ?? 0, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color) });
+        // initial heading: convert feed bearing via the user-calibrated mode (compass = 90 - b)
+        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], tLon: s.pos[0], tLat: s.pos[1], heading: ((90 - (s.bearing ?? 0)) + 360) % 360, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color) });
       }
       continue;
     }
