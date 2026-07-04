@@ -15,7 +15,18 @@ Mode: continuous through phases, skip-and-note on hard blockers, git commit at e
 - MARTA / Paris feeds — need free API keys/tokens from you.
 
 ## Progress
-- [in progress] Phase 1 setup: repo scaffold, toolchain, configs.
+- [x] Phase 1 setup: repo scaffold, toolchain, configs. (commit: scaffold)
+- [x] Portable Node 24.18 installed + verified (no admin needed).
+- [x] `shared/types.ts` — normalized data model.
+- [x] `preprocess/nyc.ts` — downloads real GTFS, builds shapes+cum distance / stops / routes / trips.
+      VERIFIED vs live data: 29 routes, 257 shapes, 1488 stops, 20309 trips; sample shape = 23.52 km. ✓
+- [x] `ingest/nyc.ts` — fetches + decodes all 8 live NYC subway feeds into RawVehicle[].
+      VERIFIED vs live feed: 306 active trips, 279 with next-stop predictions, correct station names/ETAs. ✓
+- [ ] `core/interpolate.ts` — position along shape from predictions + correction easing (§6). NEXT
+- [ ] `history/db.ts` — node:sqlite writer, rolling 7-day.
+- [ ] `server/index.ts` — WebSocket fan-out + static serving.
+- [ ] `web/` — Vite + MapLibre + deck.gl 3D scene with the reference visual system.
+- [ ] All NYC lines rendering + hover/click + search + scrub playback.
 
 ## Blockers encountered
-_(none yet)_
+_(none yet — all Phase 1 data dependencies verified reachable and working.)_
