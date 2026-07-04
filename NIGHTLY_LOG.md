@@ -55,12 +55,23 @@ npm run server        # serves built app + live data on http://localhost:8080
 ```
 
 ## Refinements to revisit (noted, non-blocking)
-- Interpolation: some vehicles show speed 0 / next-stop `undefined` — vehicle-only entities
-  (no TripUpdate) or STOPPED_AT with no forward stop. Improve next-stop coverage & moving fraction.
+- [x] Interpolation moving fraction & next-stop coverage — FIXED (late trains creep instead of
+      parking; next-stop derived from shapeStops). Now ~126/251 moving, 242/251 labeled.
+- **Shape-variant matching (known limitation):** realtime trips resolve a shape by route+direction
+  only, so express/local variants collapse onto one representative shape — a few trains can overlap
+  at the same distance. Proper fix: match realtime trips to the correct static shape by stop pattern.
 - Elevation is hardcoded "underground" — needs per-segment elevated/surface data for the
-  "trains pass under each other" feature (deferred; needs a data source or heuristic).
-- Broadcast is full-state each tick (264 vehicles); diffing is a later optimization.
-- Straight-line fallback for unmatched trips not yet wired (currently skipped; ~3/269).
+  "trains pass under each other" feature (deferred; needs a data source like OSM).
+- Broadcast is full-state each tick (~250 vehicles, ~40KB/30s = negligible); diffing deferred —
+  not worth the protocol risk to the (browser-unverified) frontend for no real bandwidth gain.
+- Straight-line fallback effectively moot: route+dir fallback resolves 100% of trips to a shape;
+  the ~26 dropped/tick have no stop anchor at all (unplaceable), which is correct to skip.
+
+## Loop iteration 2 (backend refinements, verifiable)
+- [x] Diagnosed feed (core/diag.ts): 238/277 have next-stop+ETA; 78 ETAs already past (the parking bug).
+- [x] Fixed interpolation moving/labeling. Committed.
+- [x] README.md for the public repo. Committed.
+- Browser still offline — retried, no luck; frontend visual verification still pending real Chrome.
 
 ## Blockers encountered
 _(none — all Phase 1 data dependencies verified; backend fully working against live data.)_
