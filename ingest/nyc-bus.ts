@@ -42,7 +42,7 @@ export async function fetchNycBuses(): Promise<VehicleState[]> {
         color: BUS_COLOR,
         shapeId: null,
         dist: 0,
-        speed: toNum(p.speed) ?? 7, // m/s; assume ~7 if the feed omits it
+        speed: Math.max(5, toNum(p.speed) ?? 7), // m/s; floor so buses always creep
         bearing: p.bearing ?? 0,
         pos: [p.longitude, p.latitude],
         elevation: "surface",
@@ -52,7 +52,8 @@ export async function fetchNycBuses(): Promise<VehicleState[]> {
   } catch (e) {
     console.error("[nyc-bus] error:", (e as Error).message);
   }
-  return out;
+  // Cap for constant framerate (user pref). Full fleet can be ~2k+ buses.
+  return out.slice(0, 400);
 }
 
 const isMain =

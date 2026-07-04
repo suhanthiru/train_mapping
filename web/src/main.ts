@@ -9,7 +9,7 @@ import { PathLayer, ScatterplotLayer } from "@deck.gl/layers";
 import { SimpleMeshLayer } from "@deck.gl/mesh-layers";
 import type { PickingInfo } from "@deck.gl/core";
 import { distToLonLat, bearingAt, type Shape } from "./geo.ts";
-import { trainMesh, busMesh } from "./mesh.ts";
+import { trainCarMesh, busMesh } from "./mesh.ts";
 
 const HOST = location.hostname || "localhost";
 const HTTP = `http://${HOST}:8080`;
@@ -34,10 +34,12 @@ const hex2rgb = (h: string): [number, number, number] => {
 let shapes: Record<string, Shape> = {};
 let routes: Record<string, RouteInfo> = {};
 const vehicles = new Map<string, Vehicle>();
-interface Bus { id: string; lon: number; lat: number; cLon: number; cLat: number; bearing: number; speed: number; route: string; color: [number, number, number]; }
+interface Bus { id: string; lon: number; lat: number; cLon: number; cLat: number; lastLon: number; lastLat: number; bearing: number; speed: number; route: string; color: [number, number, number]; }
 const buses = new Map<string, Bus>();
-const MESH = trainMesh();
+const CAR_MESH = trainCarMesh();
 const BUS_MESH = busMesh();
+const CARS_PER_TRAIN = 5;
+const CAR_SPACING = 26; // meters between subway car centers along the track
 const statEl = document.getElementById("stat")!;
 const tipEl = document.getElementById("tooltip")!;
 
@@ -140,30 +142,46 @@ function buildStatic() {
     }),
     new ScatterplotLayer({
       id: "stations", data: stationPts,
-      getPosition: (d: any) => d.pos, getFillColor: [150, 220, 255, 110],
-      getRadius: 24, radiusMinPixels: 1, radiusMaxPixels: 4, parameters: { depthTest: false },
+      getPosition: (d: any) => d.pos,
+      getFillColor: [8, 18, 26, 230],
+      stroked: true, getLineColor: [130, 235, 255, 255], lineWidthMinPixels: 1.5, getLineWidth: 2,
+      getRadius: 34, radiusMinPixels: 3, radiusMaxPixels: 9,
+      parameters: { depthTest: false },
     }),
   ];
 }
 
-// dynamic train layers — rebuilt each frame with fresh positions
+// dynamic train layers — each train drawn as CARS_PER_TRAIN cars placed along
+// the track shape, so it articulates around curves. Rebuilt each frame.
+interface Car { position: [number, number]; angle: number; color: [number, number, number]; v: Vehicle; }
 function trainLayers() {
-  const data = [...vehicles.values()];
+  const heads = [...vehicles.values()];
+  const cars: Car[] = [];
+  for (const v of heads) {
+    const shape = shapes[v.shapeId];
+    if (!shape) continue;
+    for (let i = 0; i < CARS_PER_TRAIN; i++) {
+      const d = v.dist - i * CAR_SPACING;
+      if (d < 0) break;
+      const p = distToLonLat(shape, d);
+      cars.push({ position: [p[0], p[1]], angle: bearingAt(shape, d), color: v.color, v });
+    }
+  }
   return [
     new ScatterplotLayer({
-      id: "train-glow", data,
+      id: "train-glow", data: heads,
       getPosition: (d: Vehicle) => d.position,
-      getFillColor: (d: Vehicle) => [...d.color, 235] as [number, number, number, number],
-      getRadius: 45, radiusMinPixels: 3, radiusMaxPixels: 11, pickable: true,
+      getFillColor: (d: Vehicle) => [...d.color, 210] as [number, number, number, number],
+      getRadius: 26, radiusMinPixels: 2, radiusMaxPixels: 7, pickable: true,
       updateTriggers: { getPosition: performance.now() },
       parameters: { depthTest: false },
     }),
     new SimpleMeshLayer({
-      id: "trains", data, mesh: MESH as any,
-      getPosition: (d: Vehicle) => d.position,
-      getColor: (d: Vehicle) => d.color,
-      getOrientation: (d: Vehicle) => [0, 90 - d.angle, 90],
-      sizeScale: 1.4, pickable: true, material: false,
+      id: "trains", data: cars, mesh: CAR_MESH as any,
+      getPosition: (d: Car) => d.position,
+      getColor: (d: Car) => d.color,
+      getOrientation: (d: Car) => [0, 90 - d.angle, 0], // roll 0: sits flat on track
+      sizeScale: 1.3, pickable: true, material: false,
       updateTriggers: { getPosition: performance.now(), getOrientation: performance.now() },
       parameters: { depthTest: false },
     }),
@@ -185,8 +203,8 @@ function busLayers() {
       id: "buses", data, mesh: BUS_MESH as any,
       getPosition: (d: Bus) => [d.lon, d.lat],
       getColor: (d: Bus) => d.color,
-      getOrientation: (d: Bus) => [0, 90 - d.bearing, 90],
-      sizeScale: 2.5, material: false, pickable: true,
+      getOrientation: (d: Bus) => [0, 90 - d.bearing, 0], // roll 0: flat on the road
+      sizeScale: 2.2, material: false, pickable: true,
       updateTriggers: { getPosition: performance.now(), getOrientation: performance.now() },
       parameters: { depthTest: false },
     }),
@@ -197,6 +215,7 @@ function updateLayers() { overlay.setProps({ layers: [...staticLayers, ...trainL
 
 // --- animation: dead-reckon anchor forward (boosted) + ease render toward it ---
 let lastT = performance.now();
+let bloomFrame = 0;
 function frame(now: number) {
   try {
     const dt = Math.min(0.1, (now - lastT) / 1000);
@@ -230,7 +249,7 @@ function frame(now: number) {
       } catch { /* skip a bad bus */ }
     }
     updateLayers();
-    drawBloom();
+    if (++bloomFrame % 3 === 0) drawBloom(); // throttle the full-canvas bloom copy
   } catch (e) {
     console.error("[frame] error (loop continues):", e);
   } finally {
@@ -254,7 +273,7 @@ function drawBloom() {
 function onHover(info: PickingInfo) {
   const id = info.layer?.id;
   if (info.object && (id === "trains" || id === "train-glow")) {
-    const v = info.object as Vehicle;
+    const v = (id === "trains" ? (info.object as Car).v : info.object) as Vehicle;
     const c = routes[routeOfShape(v.shapeId)];
     tipEl.style.display = "block";
     tipEl.style.left = info.x + 14 + "px";
@@ -286,11 +305,16 @@ function applyState(list: any[]) {
       busSeen.add(s.id);
       const eb = buses.get(s.id);
       if (eb) {
-        eb.cLon = s.pos[0] - eb.lon; eb.cLat = s.pos[1] - eb.lat;
-        if (Math.abs(eb.cLon) > 0.02 || Math.abs(eb.cLat) > 0.02) { eb.lon = s.pos[0]; eb.lat = s.pos[1]; eb.cLon = 0; eb.cLat = 0; }
-        eb.bearing = s.bearing ?? eb.bearing; eb.speed = s.speed ?? eb.speed;
+        // only re-anchor when the GPS actually changed (a real new fetch),
+        // otherwise the repeated re-sends would keep yanking it to a fixed point
+        if (s.pos[0] !== eb.lastLon || s.pos[1] !== eb.lastLat) {
+          eb.lastLon = s.pos[0]; eb.lastLat = s.pos[1];
+          eb.cLon = s.pos[0] - eb.lon; eb.cLat = s.pos[1] - eb.lat;
+          if (Math.abs(eb.cLon) > 0.02 || Math.abs(eb.cLat) > 0.02) { eb.lon = s.pos[0]; eb.lat = s.pos[1]; eb.cLon = 0; eb.cLat = 0; }
+          eb.bearing = s.bearing ?? eb.bearing; eb.speed = s.speed ?? eb.speed;
+        }
       } else {
-        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], cLon: 0, cLat: 0, bearing: s.bearing ?? 0, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color) });
+        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], cLon: 0, cLat: 0, lastLon: s.pos[0], lastLat: s.pos[1], bearing: s.bearing ?? 0, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color) });
       }
       continue;
     }
