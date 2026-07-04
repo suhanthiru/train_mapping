@@ -14,7 +14,7 @@ import { trainCarMesh, busMesh } from "./mesh.ts";
 const HOST = location.hostname || "localhost";
 const HTTP = `http://${HOST}:8080`;
 const WS = `ws://${HOST}:8080`;
-const SPEED_BOOST = 1.5; // mild exaggeration for liveliness; motion stays ~accurate
+const SPEED_BOOST = 1.0; // real rate — no overshoot, so no snap-back/reversing
 
 interface RouteInfo { id: string; color: string; textColor: string; shortName: string }
 interface Stop { id: string; name: string; pos: [number, number] }
@@ -34,12 +34,12 @@ const hex2rgb = (h: string): [number, number, number] => {
 let shapes: Record<string, Shape> = {};
 let routes: Record<string, RouteInfo> = {};
 const vehicles = new Map<string, Vehicle>();
-interface Bus { id: string; lon: number; lat: number; cLon: number; cLat: number; lastLon: number; lastLat: number; bearing: number; speed: number; route: string; color: [number, number, number]; }
+interface Bus { id: string; lon: number; lat: number; tLon: number; tLat: number; bearing: number; speed: number; route: string; color: [number, number, number]; }
 const buses = new Map<string, Bus>();
 const CAR_MESH = trainCarMesh();
 const BUS_MESH = busMesh();
-const CARS_PER_TRAIN = 5;
-const CAR_SPACING = 26; // meters between subway car centers along the track
+const CARS_PER_TRAIN = 3;
+const CAR_SPACING = 30; // meters between subway car centers along the track
 const statEl = document.getElementById("stat")!;
 const tipEl = document.getElementById("tooltip")!;
 
@@ -216,7 +216,9 @@ function updateLayers() { overlay.setProps({ layers: [...staticLayers, ...trainL
 // --- animation: dead-reckon anchor forward (boosted) + ease render toward it ---
 let lastT = performance.now();
 let bloomFrame = 0;
+let renderTick = 0;
 function frame(now: number) {
+  if (++renderTick % 2 === 1) { requestAnimationFrame(frame); return; } // cap render ~30fps
   try {
     const dt = Math.min(0.1, (now - lastT) / 1000);
     lastT = now;
@@ -238,18 +240,12 @@ function frame(now: number) {
       } catch { /* skip one bad vehicle */ }
     }
     for (const b of buses.values()) {
-      try {
-        const d = b.speed * SPEED_BOOST * dt; // meters along bearing
-        const br = (b.bearing * Math.PI) / 180;
-        b.lat += (d * Math.cos(br)) / 111320;
-        b.lon += (d * Math.sin(br)) / (111320 * Math.cos((b.lat * Math.PI) / 180));
-        const kc = Math.min(1, dt / 1.5); // absorb GPS correction smoothly
-        b.lon += b.cLon * kc; b.cLon -= b.cLon * kc;
-        b.lat += b.cLat * kc; b.cLat -= b.cLat * kc;
-      } catch { /* skip a bad bus */ }
+      const k = Math.min(1, dt / 1.5); // ease toward the on-road GPS point
+      b.lon += (b.tLon - b.lon) * k;
+      b.lat += (b.tLat - b.lat) * k;
     }
     updateLayers();
-    if (++bloomFrame % 3 === 0) drawBloom(); // throttle the full-canvas bloom copy
+    if (++bloomFrame % 2 === 0) drawBloom(); // throttle the full-canvas bloom copy
   } catch (e) {
     console.error("[frame] error (loop continues):", e);
   } finally {
@@ -305,16 +301,13 @@ function applyState(list: any[]) {
       busSeen.add(s.id);
       const eb = buses.get(s.id);
       if (eb) {
-        // only re-anchor when the GPS actually changed (a real new fetch),
-        // otherwise the repeated re-sends would keep yanking it to a fixed point
-        if (s.pos[0] !== eb.lastLon || s.pos[1] !== eb.lastLat) {
-          eb.lastLon = s.pos[0]; eb.lastLat = s.pos[1];
-          eb.cLon = s.pos[0] - eb.lon; eb.cLat = s.pos[1] - eb.lat;
-          if (Math.abs(eb.cLon) > 0.02 || Math.abs(eb.cLat) > 0.02) { eb.lon = s.pos[0]; eb.lat = s.pos[1]; eb.cLon = 0; eb.cLat = 0; }
-          eb.bearing = s.bearing ?? eb.bearing; eb.speed = s.speed ?? eb.speed;
-        }
+        // ease toward the reported GPS (which is on the road); don't dead-reckon
+        // along heading — that cuts across curves and drifts off the street
+        eb.tLon = s.pos[0]; eb.tLat = s.pos[1];
+        eb.bearing = s.bearing ?? eb.bearing; eb.speed = s.speed ?? eb.speed;
+        if (Math.abs(eb.tLon - eb.lon) > 0.02 || Math.abs(eb.tLat - eb.lat) > 0.02) { eb.lon = eb.tLon; eb.lat = eb.tLat; } // snap big jumps
       } else {
-        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], cLon: 0, cLat: 0, lastLon: s.pos[0], lastLat: s.pos[1], bearing: s.bearing ?? 0, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color) });
+        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], tLon: s.pos[0], tLat: s.pos[1], bearing: s.bearing ?? 0, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color) });
       }
       continue;
     }
