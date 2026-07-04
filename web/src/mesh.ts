@@ -81,8 +81,10 @@ function boxMesh(L: number, W: number, Wt: number, H: number): Geometry {
     for (const v of [a, b, c]) { pos.push(v[0], v[1], v[2]); nor.push(nx, ny, nz); uv.push(0, 0); }
   };
   const quad = (a: number[], b: number[], c: number[], d: number[]) => { tri(a, b, c); tri(a, c, d); };
-  const fbl = [-L, -W, 0], fbr = [-L, W, 0], nbl = [L, -W, 0], nbr = [L, W, 0];
-  const ftl = [-L, -Wt, H], ftr = [-L, Wt, H], ntl = [L, -Wt, H], ntr = [L, Wt, H];
+  // Y is UP (deck.gl SimpleMeshLayer convention): height along +Y, length along X,
+  // width along Z. Building it Z-up made the heading rotation bank the mesh sideways.
+  const fbl = [-L, 0, -W], fbr = [-L, 0, W], nbl = [L, 0, -W], nbr = [L, 0, W];
+  const ftl = [-L, H, -Wt], ftr = [-L, H, Wt], ntl = [L, H, -Wt], ntr = [L, H, Wt];
   quad(fbl, fbr, nbr, nbl); quad(ftl, ntl, ntr, ftr);
   quad(fbl, nbl, ntl, ftl); quad(fbr, ftr, ntr, nbr);
   quad(fbl, ftl, ftr, fbr); quad(nbl, nbr, ntr, ntl);
@@ -96,29 +98,3 @@ function boxMesh(L: number, W: number, Wt: number, H: number): Geometry {
   });
 }
 
-// (legacy) single-mesh multi-car train — kept for reference; unused now.
-export function busMeshOld(): Geometry {
-  const L = 7, W = 2.4, Wt = 1.9, H = 3.4; // half-dims (meters)
-  const pos: number[] = [], nor: number[] = [], uv: number[] = [];
-  const tri = (a: number[], b: number[], c: number[]) => {
-    const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
-    const wx = c[0] - a[0], wy = c[1] - a[1], wz = c[2] - a[2];
-    let nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
-    const l = Math.hypot(nx, ny, nz) || 1; nx /= l; ny /= l; nz /= l;
-    for (const v of [a, b, c]) { pos.push(v[0], v[1], v[2]); nor.push(nx, ny, nz); uv.push(0, 0); }
-  };
-  const quad = (a: number[], b: number[], c: number[], d: number[]) => { tri(a, b, c); tri(a, c, d); };
-  const fbl = [-L, -W, 0], fbr = [-L, W, 0], nbl = [L, -W, 0], nbr = [L, W, 0];
-  const ftl = [-L, -Wt, H], ftr = [-L, Wt, H], ntl = [L, -Wt, H], ntr = [L, Wt, H];
-  quad(fbl, fbr, nbr, nbl); quad(ftl, ntl, ntr, ftr);
-  quad(fbl, nbl, ntl, ftl); quad(fbr, ftr, ntr, nbr);
-  quad(fbl, ftl, ftr, fbr); quad(nbl, nbr, ntr, ntl);
-  return new Geometry({
-    topology: "triangle-list",
-    attributes: {
-      positions: { size: 3, value: new Float32Array(pos) },
-      normals: { size: 3, value: new Float32Array(nor) },
-      texCoords: { size: 2, value: new Float32Array(uv) },
-    },
-  });
-}
