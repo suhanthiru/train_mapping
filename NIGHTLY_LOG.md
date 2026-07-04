@@ -30,10 +30,17 @@ Mode: continuous through phases, skip-and-note on hard blockers, git commit at e
 - [~] `web/` — Vite + deck.gl 3D scene BUILT (908 modules, 0 errors). Backend serves it.
       Glowing colored subway lines (real MTA colors), 3D train meshes, 60fps tween + correction
       easing, WebSocket live feed, dual-canvas bloom, hover tooltips, glassmorphism HUD.
-      ⚠️ **NOT visually verified** — Chrome extension was offline in the autonomous session, so I
-      could not screenshot the live render. Build + serve verified; in-browser render is the #1
-      morning check. Hardened the known deck.gl v9 risks (SimpleMeshLayer texCoords, removed
-      uncertain Deck params). If something's off it'll be train mesh orientation/scale or a deck API detail.
+      ⚠️ **Functionally verified, pixels NOT verified.** Ran it via a headless preview browser:
+      app loads with ZERO console errors, fetches shapes/routes/stops (200s), WebSocket connects
+      with 264–268 live trains flowing into state, deck.gl instantiates with a live (non-lost) GL
+      context. BUT requestAnimationFrame does not fire in the headless preview (no compositor), so
+      deck.gl's resize + the render loop never tick there — canvas stayed 300×150 and screenshots
+      timed out. This is an ENVIRONMENT limitation, not an app bug; a real browser ticks RAF fine.
+      Added a ResizeObserver canvas-sizing guard (web/src/main.ts) as belt-and-suspenders.
+      Chrome extension (for real screenshots) was offline all session.
+      **#1 morning check:** open http://localhost:8080 in real Chrome — confirm trains render/move,
+      then tune mesh orientation/scale, bloom, colors. Everything up to the GL draw is confirmed working.
+      Added infra/static.mjs + .claude/launch.json (web-dist preview config) for quick local viewing.
 - [ ] Phase 2: all-lines polish, click-to-focus route highlight, search bar, scrub playback UI,
       underground elevation, straight-line fallback, diff-based broadcast.
 

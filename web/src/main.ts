@@ -48,6 +48,20 @@ const deck = new Deck({
   onHover: onHover,
 });
 
+// deck.gl doesn't always size an externally-provided canvas buffer — do it
+// explicitly from the laid-out CSS size (innerWidth can be 0 at module-eval time).
+const _canvas = document.getElementById("deck-canvas") as HTMLCanvasElement;
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = _canvas.clientWidth || window.innerWidth || 1280;
+  const h = _canvas.clientHeight || window.innerHeight || 720;
+  _canvas.width = Math.max(1, Math.floor(w * dpr));
+  _canvas.height = Math.max(1, Math.floor(h * dpr));
+}
+new ResizeObserver(resizeCanvas).observe(_canvas);
+window.addEventListener("resize", resizeCanvas);
+resizeCanvas();
+
 function buildStaticLayers() {
   const linePaths = Object.values(shapes).map((s) => ({
     path: s.pts,
