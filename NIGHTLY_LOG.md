@@ -22,11 +22,21 @@ Mode: continuous through phases, skip-and-note on hard blockers, git commit at e
       VERIFIED vs live data: 29 routes, 257 shapes, 1488 stops, 20309 trips; sample shape = 23.52 km. ✓
 - [x] `ingest/nyc.ts` — fetches + decodes all 8 live NYC subway feeds into RawVehicle[].
       VERIFIED vs live feed: 306 active trips, 279 with next-stop predictions, correct station names/ETAs. ✓
-- [ ] `core/interpolate.ts` — position along shape from predictions + correction easing (§6). NEXT
-- [ ] `history/db.ts` — node:sqlite writer, rolling 7-day.
-- [ ] `server/index.ts` — WebSocket fan-out + static serving.
-- [ ] `web/` — Vite + MapLibre + deck.gl 3D scene with the reference visual system.
+- [x] `shared/geo.ts` — project stops onto shapes, dist<->lonlat, bearing.
+- [x] `core/interpolate.ts` — position along shape (§6). VERIFIED: 266 live trains, 100% in NYC bounds. ✓
+- [x] `history/db.ts` — node:sqlite writer, rolling 7-day retention + scrub queries.
+- [x] `server/index.ts` — 30s poll loop + WebSocket fan-out + static geometry serving.
+      VERIFIED: /health=264 vehicles, ws snapshot delivered, data served. ✓ **Backend complete.**
+- [ ] `web/` — Vite + MapLibre + deck.gl 3D scene with the reference visual system. NEXT (big chunk)
 - [ ] All NYC lines rendering + hover/click + search + scrub playback.
 
+## Refinements to revisit (noted, non-blocking)
+- Interpolation: some vehicles show speed 0 / next-stop `undefined` — vehicle-only entities
+  (no TripUpdate) or STOPPED_AT with no forward stop. Improve next-stop coverage & moving fraction.
+- Elevation is hardcoded "underground" — needs per-segment elevated/surface data for the
+  "trains pass under each other" feature (deferred; needs a data source or heuristic).
+- Broadcast is full-state each tick (264 vehicles); diffing is a later optimization.
+- Straight-line fallback for unmatched trips not yet wired (currently skipped; ~3/269).
+
 ## Blockers encountered
-_(none yet — all Phase 1 data dependencies verified reachable and working.)_
+_(none — all Phase 1 data dependencies verified; backend fully working against live data.)_
