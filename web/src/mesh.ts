@@ -61,17 +61,17 @@ export function trainMesh(): Geometry {
 // Single subway car (chamfered box). Trains are drawn as several of these
 // placed along the track shape, so the train articulates around curves.
 export function trainCarMesh(): Geometry {
-  return boxMesh(11, 6.2, 4.4, 10.5); // half-len, floor half-w, roof half-w, height
+  return boxMesh(11, 6.2, 4.4, 10.5, 0.85); // half-len, floor half-w, roof half-w, height
 }
 
-// A bus — proper proportions (long & narrow, clear forward direction).
-// half-len 6 (12m) x half-width 1.3 (2.6m) x height 3.2m — real bus ratio.
+// A bus — proper proportions (long & narrow), tapered nose so the front is visible.
 export function busMesh(): Geometry {
-  return boxMesh(6, 1.3, 1.05, 3.2);
+  return boxMesh(6, 1.3, 1.05, 3.2, 0.5);
 }
 
 // Chamfered box (trapezoidal cross-section: wider floor, narrower roof).
-function boxMesh(L: number, W: number, Wt: number, H: number): Geometry {
+// `nose` < 1 tapers the +X end so the direction of travel is visually obvious.
+function boxMesh(L: number, W: number, Wt: number, H: number, nose = 1): Geometry {
   const pos: number[] = [], nor: number[] = [], uv: number[] = [];
   const tri = (a: number[], b: number[], c: number[]) => {
     const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
@@ -84,8 +84,8 @@ function boxMesh(L: number, W: number, Wt: number, H: number): Geometry {
   // Z is UP. Verified against deck.gl source (mesh-layers/utils/matrix.js):
   // with orientation [0, yaw, 0], model Z maps to world up (0,0,1) and model X
   // yaws in the horizontal east/north plane — so height goes on +Z, length on X.
-  const fbl = [-L, -W, 0], fbr = [-L, W, 0], nbl = [L, -W, 0], nbr = [L, W, 0];
-  const ftl = [-L, -Wt, H], ftr = [-L, Wt, H], ntl = [L, -Wt, H], ntr = [L, Wt, H];
+  const fbl = [-L, -W, 0], fbr = [-L, W, 0], nbl = [L, -W * nose, 0], nbr = [L, W * nose, 0];
+  const ftl = [-L, -Wt, H], ftr = [-L, Wt, H], ntl = [L, -Wt * nose, H], ntr = [L, Wt * nose, H];
   quad(fbl, fbr, nbr, nbl); quad(ftl, ntl, ntr, ftr);
   quad(fbl, nbl, ntl, ftl); quad(fbr, ftr, ntr, nbr);
   quad(fbl, ftl, ftr, fbr); quad(nbl, nbr, ntr, ntl);

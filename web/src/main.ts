@@ -43,6 +43,24 @@ const CAR_SPACING = 26; // meters between subway car centers along the track
 const statEl = document.getElementById("stat")!;
 const tipEl = document.getElementById("tooltip")!;
 
+// --- live calibration/diagnostics (temporary): press 1-4 to cycle bus yaw
+// formulas, B to toggle 3D buildings, G to toggle bloom. FPS shown in the HUD.
+let busYawMode = 0;
+const busYaw = (b: number) => [90 - b, b - 90, -b, b][busYawMode];
+let bloomOn = true;
+let statBase = "connecting…";
+let fpsCount = 0, fpsLast = performance.now(), fpsVal = 0;
+window.addEventListener("keydown", (e) => {
+  if (e.key >= "1" && e.key <= "4") { busYawMode = +e.key - 1; console.log("[cal] bus yaw mode", e.key); }
+  else if (e.key === "b" || e.key === "B") {
+    const vis = map.getLayoutProperty("buildings", "visibility");
+    map.setLayoutProperty("buildings", "visibility", vis === "none" ? "visible" : "none");
+  } else if (e.key === "g" || e.key === "G") {
+    bloomOn = !bloomOn;
+    (document.getElementById("bloom-canvas") as HTMLCanvasElement).style.display = bloomOn ? "" : "none";
+  }
+});
+
 const routeOfShape = (id: string) => id.split("..")[0];
 const shapeColor = (id: string): [number, number, number] => {
   const r = routes[routeOfShape(id)];
@@ -235,7 +253,7 @@ function busLayers() {
       id: "buses", data, mesh: BUS_MESH as any,
       getPosition: (d: Bus) => [d.lon, d.lat],
       getColor: (d: Bus) => d.color,
-      getOrientation: (d: Bus) => [0, 90 - d.bearing, 0], // roll 0: flat on the road
+      getOrientation: (d: Bus) => [0, busYaw(d.bearing), 0], // yaw formula selectable via keys 1-4
       sizeScale: 1.7, material: false, pickable: true,
       updateTriggers: { getPosition: performance.now(), getOrientation: performance.now() },
       parameters: { depthTest: true, depthMask: true }, // occluded by 3D buildings (no clipping through)
@@ -280,7 +298,13 @@ function frame(now: number) {
     if (now - lastLayerPush > 100) {
       lastLayerPush = now;
       updateLayers();
-      drawBloom();
+      if (bloomOn) drawBloom();
+    }
+    fpsCount++;
+    if (now - fpsLast > 500) {
+      fpsVal = Math.round((fpsCount * 1000) / (now - fpsLast));
+      fpsCount = 0; fpsLast = now;
+      statEl.textContent = `${statBase} · ${fpsVal} fps · bus-dir ${busYawMode + 1} [1-4] · [B]ldgs [G]low`;
     }
   } catch (e) {
     console.error("[frame] error (loop continues):", e);
@@ -367,7 +391,7 @@ function applyState(list: any[]) {
   }
   for (const id of [...vehicles.keys()]) if (!seen.has(id)) vehicles.delete(id);
   for (const id of [...buses.keys()]) if (!busSeen.has(id)) buses.delete(id);
-  statEl.textContent = `${vehicles.size} trains · ${buses.size} buses live · NYC`;
+  statBase = `${vehicles.size} trains · ${buses.size} buses live · NYC`;
   (window as any).__tt = { vehicles, buses, shapes, map, overlay };
 }
 
