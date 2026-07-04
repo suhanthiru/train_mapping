@@ -9,6 +9,7 @@ import { parse } from "csv-parse/sync";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { Shape, Stop, RouteInfo, TripInfo } from "../shared/types.ts";
+import { projectDist } from "../shared/geo.ts";
 
 const GTFS_URL = "https://rrgtfsfeeds.s3.amazonaws.com/gtfs_subway.zip";
 const OUT_DIR = join(process.cwd(), "data", "nyc");
@@ -114,10 +115,53 @@ async function main() {
       shapeId: t.shape_id,
       directionId: Number(t.direction_id ?? 0),
     };
-    const key = `${t.route_id}|${t.direction_id ?? 0}`;
+    // Key by direction LETTER (N/S) parsed from the shape_id (e.g. "1..N03R"),
+    // because realtime stop_ids carry the same N/S suffix — lets us resolve a
+    // shape for realtime trips that aren't in the static trips table.
+    const m = String(t.shape_id).match(/\.\.?([NS])/);
+    const dir = m ? m[1] : Number(t.direction_id ?? 0) === 1 ? "S" : "N";
+    const key = `${t.route_id}|${dir}`;
     if (!routeDirShape[key]) routeDirShape[key] = t.shape_id;
   }
   console.log(`[nyc] trips: ${Object.keys(trips).length}`);
+
+  // ---- shapeStops: ordered [{id, dist}] per shape (for interpolation §6) ----
+  // Pick one representative trip per shape, read its stop sequence from
+  // stop_times.txt, project each stop onto the shape to get distance-along.
+  const repTripForShape: Record<string, string> = {}; // shapeId -> trip_id
+  const shapeOfTrip: Record<string, string> = {}; // trip_id -> shapeId (rep only)
+  for (const t of tripsRaw) {
+    if (!t.shape_id) continue;
+    if (!repTripForShape[t.shape_id]) {
+      repTripForShape[t.shape_id] = t.trip_id;
+      shapeOfTrip[t.trip_id] = t.shape_id;
+    }
+  }
+  console.log(`[nyc] reading stop_times.txt (filtering to ${Object.keys(repTripForShape).length} rep trips)...`);
+  const stopTimesRaw = read("stop_times.txt");
+  const seqByShape: Record<string, { stopId: string; seq: number }[]> = {};
+  for (const st of stopTimesRaw) {
+    const shapeId = shapeOfTrip[st.trip_id];
+    if (!shapeId) continue; // not a representative trip
+    (seqByShape[shapeId] ??= []).push({
+      stopId: st.stop_id,
+      seq: Number(st.stop_sequence),
+    });
+  }
+  const shapeStops: Record<string, { id: string; dist: number }[]> = {};
+  for (const [shapeId, seq] of Object.entries(seqByShape)) {
+    seq.sort((a, b) => a.seq - b.seq);
+    const shape = shapes[shapeId];
+    if (!shape) continue;
+    shapeStops[shapeId] = seq
+      .map(({ stopId }) => {
+        const stop = stops[stopId];
+        if (!stop) return null;
+        return { id: stopId, dist: projectDist(shape, stop.pos[0], stop.pos[1]) };
+      })
+      .filter((x): x is { id: string; dist: number } => x !== null);
+  }
+  console.log(`[nyc] shapeStops: ${Object.keys(shapeStops).length} shapes with ordered stops`);
 
   // ---- write outputs ----
   const write = (name: string, obj: unknown) => {
@@ -130,6 +174,7 @@ async function main() {
   write("stops.json", stops);
   write("trips.json", trips);
   write("routeDirShape.json", routeDirShape);
+  write("shapeStops.json", shapeStops);
   write("meta.json", {
     city: "nyc",
     generated: new Date().toISOString(),
