@@ -92,7 +92,7 @@ const map = new maplibregl.Map({
 });
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
 
-const overlay = new MapboxOverlay({ interleaved: true, layers: [], onHover });
+const overlay = new MapboxOverlay({ interleaved: true, pickingRadius: 8, layers: [], onHover, onClick });
 map.addControl(overlay as any);
 
 // warm/cool lighting on the extrusions
@@ -100,31 +100,63 @@ map.on("style.load", () => {
   try { map.setLight({ anchor: "viewport", color: "#9fb8d8", intensity: 0.35, position: [1.2, 200, 40] }); } catch {}
 });
 
-// click a station -> live arrivals board (isolated from the animation loop)
+// --- click handling via deck picking: train -> journey timeline, station -> arrivals ---
 const arrivalsEl = document.getElementById("arrivals")!;
-map.on("click", async (e) => {
-  const { lng, lat } = e.lngLat;
-  let best: Stop | null = null, bestD = Infinity;
-  for (const s of stationPts) {
-    const d = (s.pos[0] - lng) ** 2 + (s.pos[1] - lat) ** 2;
-    if (d < bestD) { bestD = d; best = s; }
-  }
-  if (!best || bestD > 0.00006) { arrivalsEl.style.display = "none"; return; } // ~within ~800m
+const journeyEl = document.getElementById("journey")!;
+const rgbCss = (c: [number, number, number]) => `rgb(${c[0]},${c[1]},${c[2]})`;
+const fmtEta = (s: number) => (s < 45 ? "now" : `${Math.round(s / 60)} min`);
+
+async function showArrivals(stop: Stop) {
+  journeyEl.style.display = "none";
   arrivalsEl.style.display = "block";
-  arrivalsEl.innerHTML = `<b>${best.name}</b><br><span style="opacity:.6">loading…</span>`;
+  arrivalsEl.innerHTML = `<b>${stop.name}</b><br><span style="opacity:.6">loading…</span>`;
   try {
-    const data = await fetch(`${HTTP}/api/arrivals?stop=${encodeURIComponent(best.id)}`).then((r) => r.json());
-    const rows = (data.arrivals || []).map((a: any) => {
-      const eta = a.etaSec < 45 ? "now" : `${Math.round(a.etaSec / 60)} min`;
-      return `<div class="row"><span class="route-badge" style="background:${a.color}">${a.route}</span>` +
-        `<span style="flex:1;opacity:.7">${a.dir === "N" ? "▲ uptown" : "▼ downtown"}</span><span>${eta}</span></div>`;
-    }).join("");
+    const data = await fetch(`${HTTP}/api/arrivals?stop=${encodeURIComponent(stop.id)}`).then((r) => r.json());
+    const rows = (data.arrivals || []).map((a: any) =>
+      `<div class="row"><span class="route-badge" style="background:${a.color}">${a.route}</span>` +
+      `<span style="flex:1;opacity:.7">${a.dir === "N" ? "▲ uptown" : "▼ downtown"}</span><span>${fmtEta(a.etaSec)}</span></div>`
+    ).join("");
     arrivalsEl.innerHTML = `<span class="close" onclick="document.getElementById('arrivals').style.display='none'">✕</span>` +
       `<b>${data.name}</b>${rows || '<br><span style="opacity:.6">no trains inbound</span>'}`;
   } catch {
-    arrivalsEl.innerHTML = `<b>${best.name}</b><br><span style="opacity:.6">arrivals unavailable</span>`;
+    arrivalsEl.innerHTML = `<b>${stop.name}</b><br><span style="opacity:.6">arrivals unavailable</span>`;
   }
-});
+}
+
+async function showJourney(v: Vehicle) {
+  arrivalsEl.style.display = "none";
+  journeyEl.style.display = "block";
+  journeyEl.style.setProperty("--line", rgbCss(v.color));
+  journeyEl.innerHTML = `<span style="opacity:.6">loading…</span>`;
+  try {
+    const data = await fetch(`${HTTP}/api/trip?id=${encodeURIComponent(v.id)}`).then((r) => r.json());
+    journeyEl.style.setProperty("--line", data.color || rgbCss(v.color));
+    const rows = ((data.stops || []) as { name: string; etaSec: number }[]).map((s, i) =>
+      `<div class="j-stop${i === 0 ? " next" : ""}"><span class="j-dot"></span>` +
+      `<span class="j-name">${s.name}</span><span class="j-eta">${fmtEta(s.etaSec)}</span></div>`
+    ).join("");
+    journeyEl.innerHTML =
+      `<span class="close" onclick="document.getElementById('journey').style.display='none'">✕</span>` +
+      `<div class="j-head"><span class="route-badge" style="background:${data.color}">${data.route}</span>` +
+      `<div><b>${data.route} train</b>${data.dest ? `<br><span class="j-dest">toward ${data.dest}</span>` : ""}</div></div>` +
+      `<div class="j-stops">${rows || '<span style="opacity:.6">no upcoming stops in feed</span>'}</div>`;
+  } catch {
+    journeyEl.innerHTML = `<span class="close" onclick="document.getElementById('journey').style.display='none'">✕</span>` +
+      `<span style="opacity:.6">journey unavailable</span>`;
+  }
+}
+
+function onClick(info: PickingInfo) {
+  const id = info.layer?.id;
+  if (info.object && (id === "trains" || id === "train-glow")) {
+    showJourney((id === "trains" ? (info.object as Car).v : info.object) as Vehicle);
+  } else if (info.object && id === "stations") {
+    showArrivals(info.object as Stop);
+  } else {
+    arrivalsEl.style.display = "none";
+    journeyEl.style.display = "none";
+  }
+}
 
 // --- deck layers (subway network + trains), rebuilt each frame ---
 let linePaths: { path: [number, number][]; color: [number, number, number] }[] = [];
@@ -141,7 +173,7 @@ function buildStatic() {
       capRounded: true, jointRounded: true, parameters: { depthTest: false },
     }),
     new ScatterplotLayer({
-      id: "stations", data: stationPts,
+      id: "stations", data: stationPts, pickable: true,
       getPosition: (d: any) => d.pos,
       getFillColor: [8, 18, 26, 230],
       stroked: true, getLineColor: [130, 235, 255, 255], lineWidthMinPixels: 1.5, getLineWidth: 2,

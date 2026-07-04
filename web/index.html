@@ -52,7 +52,33 @@
         max-height: 62vh; overflow: auto; box-shadow: 0 4px 24px rgba(0, 0, 0, 0.6);
       }
       #arrivals .row { display: flex; align-items: center; gap: 8px; margin-top: 7px; }
-      #arrivals .close { float: right; opacity: 0.5; cursor: pointer; }
+      .close { float: right; opacity: 0.5; cursor: pointer; font-size: 14px; line-height: 1; }
+      .close:hover { opacity: 1; }
+      .route-badge { font: 700 13px/22px "Helvetica Neue", sans-serif; }
+      /* click-a-train journey timeline */
+      #journey {
+        display: none; top: 74px; left: 20px; width: 250px;
+        max-height: 66vh; overflow: auto; box-shadow: 0 8px 30px rgba(0, 0, 0, 0.7);
+      }
+      #journey .j-head { display: flex; align-items: center; gap: 10px; margin: 2px 0 12px; }
+      #journey .j-head b { font-size: 14px; color: #eafcff; }
+      #journey .j-dest { font-size: 11px; color: rgba(150, 220, 240, 0.7); }
+      #journey .j-stops { position: relative; padding-left: 4px; }
+      #journey .j-stops::before {
+        content: ""; position: absolute; left: 9px; top: 10px; bottom: 12px; width: 2px;
+        background: var(--line, #3fd8ff); opacity: 0.35; border-radius: 2px;
+      }
+      #journey .j-stop { display: grid; grid-template-columns: 16px 1fr auto; align-items: center;
+        gap: 9px; padding: 7px 0; position: relative; }
+      #journey .j-dot { width: 11px; height: 11px; border-radius: 50%;
+        border: 2px solid var(--line, #3fd8ff); background: #06121a; box-sizing: border-box; }
+      #journey .j-stop.next .j-dot { background: var(--line, #3fd8ff);
+        box-shadow: 0 0 10px var(--line, #3fd8ff); }
+      #journey .j-name { font-size: 12.5px; color: #d3f2fb; }
+      #journey .j-stop.next .j-name { color: #fff; font-weight: 600; }
+      #journey .j-eta { font-size: 12px; color: rgba(150, 220, 240, 0.85);
+        font-variant-numeric: tabular-nums; white-space: nowrap; }
+      #journey .j-stop.next .j-eta { color: var(--line, #3fd8ff); font-weight: 700; }
       #tooltip .route-badge {
         display: inline-block; min-width: 20px; height: 20px; line-height: 20px;
         text-align: center; border-radius: 10px; font-weight: 700; color: #000;
@@ -68,6 +94,7 @@
     <div id="stat" class="panel">connecting…</div>
     <div id="tooltip" class="panel"></div>
     <div id="arrivals" class="panel"></div>
+    <div id="journey" class="panel"></div>
     <div class="hud">
       <div class="line"></div>
       <h1>New York City</h1>

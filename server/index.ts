@@ -69,6 +69,26 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // A single train's upcoming stops + ETAs (for the click-a-train journey panel).
+  if (url === "/api/trip") {
+    const id = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("id") ?? "";
+    const tripId = id.replace(/^nyc:/, "");
+    const now = Math.floor(Date.now() / 1000);
+    const v = lastRaws.find((r) => r.tripId === tripId);
+    const stops = (v?.upcoming ?? [])
+      .map((u) => ({ name: stat.stops[u.stopId]?.name ?? u.stopId, etaSec: u.time - now }))
+      .filter((s) => s.etaSec > -45);
+    res.writeHead(200, { "Content-Type": "application/json" }).end(
+      JSON.stringify({
+        route: v ? stat.routes[v.routeId]?.shortName ?? v.routeId : "?",
+        color: v ? stat.routes[v.routeId]?.color ?? "#3FD8FF" : "#3FD8FF",
+        dest: stops.length ? stops[stops.length - 1].name : undefined,
+        stops,
+      })
+    );
+    return;
+  }
+
   // Live arrivals board for a station (matches both direction platforms).
   if (url === "/api/arrivals") {
     const stop = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("stop") ?? "";
