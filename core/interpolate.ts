@@ -85,6 +85,14 @@ export class Interpolator {
     return prev;
   }
 
+  /** first stop after a given distance (for labeling trains with no feed next-stop). */
+  private nextStopAfter(shapeId: string, dist: number): string | null {
+    const list = this.s.shapeStops[shapeId];
+    if (!list) return null;
+    for (const e of list) if (e.dist > dist + 1) return e.id;
+    return null;
+  }
+
   update(raws: RawVehicle[], now = Math.floor(Date.now() / 1000)): VehicleState[] {
     const out: VehicleState[] = [];
     for (const v of raws) {
@@ -96,29 +104,36 @@ export class Interpolator {
       let dist: number;
       let speed = 0;
 
-      const toDist =
-        v.toStopId != null ? this.stopDist(shapeId, v.toStopId) : null;
+      const toDist = v.toStopId ? this.stopDist(shapeId, v.toStopId) : null;
+      const atDist = v.atStopId ? this.stopDist(shapeId, v.atStopId) : null;
 
-      if (v.currentStatus === "STOPPED_AT" && v.atStopId) {
-        const d = this.stopDist(shapeId, v.atStopId);
-        dist = d ?? toDist ?? 0;
-      } else if (toDist != null && v.arriveTime) {
+      if (v.currentStatus === "STOPPED_AT" && atDist != null) {
+        dist = atDist; // genuinely dwelling at a station
+      } else if (toDist != null) {
         const fromDist =
           (v.fromStopId ? this.stopDist(shapeId, v.fromStopId) : null) ??
           this.prevStopDist(shapeId, toDist) ??
           toDist - DEFAULT_SEGMENT;
         const segLen = Math.max(1, toDist - fromDist);
         const travelTime = segLen / TYPICAL_SPEED;
-        const departTime = v.arriveTime - travelTime;
-        const frac = Math.max(0, Math.min(1, (now - departTime) / travelTime));
-        dist = fromDist + frac * segLen;
-        speed = Math.max(0, (toDist - dist) / Math.max(1, v.arriveTime - now));
-      } else if (toDist != null) {
-        dist = toDist;
+        if (v.arriveTime && v.arriveTime > now) {
+          const departTime = v.arriveTime - travelTime;
+          const frac = Math.max(0, Math.min(1, (now - departTime) / travelTime));
+          dist = fromDist + frac * segLen;
+          speed = Math.max(0, (toDist - dist) / (v.arriveTime - now));
+        } else {
+          // running late / no live ETA: creep toward the stop, don't park dead
+          dist = fromDist + 0.9 * segLen;
+          speed = TYPICAL_SPEED * 0.3;
+        }
+      } else if (atDist != null) {
+        dist = atDist; // only know which stop it's near
       } else {
         continue; // nothing to anchor to
       }
 
+      // next-stop label: use the feed's if present, else derive from geometry
+      const nextStopId = v.toStopId ?? this.nextStopAfter(shapeId, dist) ?? undefined;
       const stale = now - v.feedTimestamp > 120;
       out.push({
         id: `${this.city}:${v.tripId}`,
@@ -130,8 +145,8 @@ export class Interpolator {
         dist,
         speed,
         elevation: "underground", // per-segment refinement is a later task
-        nextStop: v.toStopId,
-        nextStopName: v.toStopId ? this.s.stops[v.toStopId]?.name : undefined,
+        nextStop: nextStopId,
+        nextStopName: nextStopId ? this.s.stops[nextStopId]?.name : undefined,
         stale,
       });
     }
@@ -164,6 +179,9 @@ if (isMain) {
     if (lon > -74.3 && lon < -73.6 && lat > 40.4 && lat < 41.0) inBounds++;
   }
   console.log(`[core] ${inBounds}/${states.length} positions within NYC bounds`);
+  const moving = states.filter((s) => s.speed > 0.1).length;
+  const withNext = states.filter((s) => s.nextStopName).length;
+  console.log(`[core] moving (speed>0): ${moving}/${states.length}; with next-stop label: ${withNext}`);
 
   for (const st of states.slice(0, 8)) {
     const [lon, lat] = distToLonLat(stat.shapes[st.shapeId!], st.dist);
