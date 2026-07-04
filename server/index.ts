@@ -65,6 +65,37 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // Live arrivals board for a station (matches both direction platforms).
+  if (url === "/api/arrivals") {
+    const stop = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("stop") ?? "";
+    const base = stop.replace(/[NS]$/, "");
+    const now = Math.floor(Date.now() / 1000);
+    const rows: { route: string; color: string; dir: string; etaSec: number }[] = [];
+    for (const v of lastRaws) {
+      if (!v.upcoming) continue;
+      for (const u of v.upcoming) {
+        if (u.stopId.replace(/[NS]$/, "") === base) {
+          rows.push({
+            route: stat.routes[v.routeId]?.shortName ?? v.routeId,
+            color: stat.routes[v.routeId]?.color ?? "#3FD8FF",
+            dir: u.stopId.slice(-1),
+            etaSec: u.time - now,
+          });
+          break;
+        }
+      }
+    }
+    rows.sort((a, b) => a.etaSec - b.etaSec);
+    res.writeHead(200, { "Content-Type": "application/json" }).end(
+      JSON.stringify({
+        stop: base,
+        name: stat.stops[base]?.name ?? stat.stops[stop]?.name ?? base,
+        arrivals: rows.filter((r) => r.etaSec > -30).slice(0, 10),
+      })
+    );
+    return;
+  }
+
   // /data/** -> generated geometry (shapes/stops/routes/…)
   // /**      -> web/dist build output
   let filePath: string;

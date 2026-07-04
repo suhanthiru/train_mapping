@@ -73,5 +73,23 @@ npm run server        # serves built app + live data on http://localhost:8080
 - [x] README.md for the public repo. Committed.
 - Browser still offline — retried, no luck; frontend visual verification still pending real Chrome.
 
+## Loop iterations 3-6 (user-driven fixes + features)
+- [x] **Real 3D city**: MapLibre + OpenFreeMap vector tiles — 3D building extrusions, water, roads,
+      dark warm palette. deck.gl trains as interleaved overlay. (user: "love the map and building design")
+- [x] **Motion fix**: was snap-back bug (frontend boosted 5x + reset to real pos each update) + ~80%
+      trains parked. Now continuous glide + gentle drift absorb; feed-anchored glide for dwelling/late
+      trains -> 242/243 moving, verified advancing across pushes. Backend split feed-poll(30s)/push(4s).
+- [x] **Real multi-car train mesh** (was a box).
+- [x] **Live arrivals board**: /api/arrivals?stop=ID (verified: Times Sq real ETAs). Click a station
+      in the UI -> glass panel with upcoming trains. Ingest now keeps upcoming-stop lists.
+- Verified headless each step (0 console errors, data-layer live). Pixel-level look still needs the
+  user's real Chrome (my screenshot tool offline all session).
+
+## Vision gap still open (the "magnum opus" asks)
+- Buses driving on roads (NYC bus GTFS-rt has real GPS — good next, verifiable at data layer)
+- Trains visibly passing UNDER/OVER each other (needs per-segment elevation data — no clean source yet)
+- Fleet-accurate models (R46/R160, MARTA, MP89) — asset work
+- Click-to-focus route highlight (dim others); scrub/playback UI; MARTA + Paris adapters
+
 ## Blockers encountered
 _(none — all Phase 1 data dependencies verified; backend fully working against live data.)_

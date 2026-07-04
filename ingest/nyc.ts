@@ -81,6 +81,15 @@ export async function fetchNycVehicles(): Promise<RawVehicle[]> {
           }
         }
 
+        // full upcoming-stop list for arrivals boards
+        const upcoming = stus
+          .map((su) => ({
+            stopId: su.stopId ?? "",
+            time: toNum(su.arrival?.time) ?? toNum(su.departure?.time) ?? 0,
+          }))
+          .filter((u) => u.stopId && u.time >= feedTs - 30)
+          .slice(0, 8);
+
         const v = out.get(tripId) ?? {
           tripId,
           routeId,
@@ -92,6 +101,7 @@ export async function fetchNycVehicles(): Promise<RawVehicle[]> {
         v.arriveTime = arriveTime ?? v.arriveTime;
         v.fromStopId = fromStopId ?? v.fromStopId;
         v.departTime = departTime ?? v.departTime;
+        if (upcoming.length) v.upcoming = upcoming;
         out.set(tripId, v);
       }
 

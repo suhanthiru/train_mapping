@@ -95,6 +95,32 @@ map.on("style.load", () => {
   try { map.setLight({ anchor: "viewport", color: "#9fb8d8", intensity: 0.35, position: [1.2, 200, 40] }); } catch {}
 });
 
+// click a station -> live arrivals board (isolated from the animation loop)
+const arrivalsEl = document.getElementById("arrivals")!;
+map.on("click", async (e) => {
+  const { lng, lat } = e.lngLat;
+  let best: Stop | null = null, bestD = Infinity;
+  for (const s of stationPts) {
+    const d = (s.pos[0] - lng) ** 2 + (s.pos[1] - lat) ** 2;
+    if (d < bestD) { bestD = d; best = s; }
+  }
+  if (!best || bestD > 0.00006) { arrivalsEl.style.display = "none"; return; } // ~within ~800m
+  arrivalsEl.style.display = "block";
+  arrivalsEl.innerHTML = `<b>${best.name}</b><br><span style="opacity:.6">loading…</span>`;
+  try {
+    const data = await fetch(`${HTTP}/api/arrivals?stop=${encodeURIComponent(best.id)}`).then((r) => r.json());
+    const rows = (data.arrivals || []).map((a: any) => {
+      const eta = a.etaSec < 45 ? "now" : `${Math.round(a.etaSec / 60)} min`;
+      return `<div class="row"><span class="route-badge" style="background:${a.color}">${a.route}</span>` +
+        `<span style="flex:1;opacity:.7">${a.dir === "N" ? "▲ uptown" : "▼ downtown"}</span><span>${eta}</span></div>`;
+    }).join("");
+    arrivalsEl.innerHTML = `<span class="close" onclick="document.getElementById('arrivals').style.display='none'">✕</span>` +
+      `<b>${data.name}</b>${rows || '<br><span style="opacity:.6">no trains inbound</span>'}`;
+  } catch {
+    arrivalsEl.innerHTML = `<b>${best.name}</b><br><span style="opacity:.6">arrivals unavailable</span>`;
+  }
+});
+
 // --- deck layers (subway network + trains), rebuilt each frame ---
 let linePaths: { path: [number, number][]; color: [number, number, number] }[] = [];
 let stationPts: Stop[] = [];

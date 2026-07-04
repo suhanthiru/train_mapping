@@ -66,6 +66,7 @@ export interface RawVehicle {
   currentStatus?: "INCOMING_AT" | "STOPPED_AT" | "IN_TRANSIT_TO";
   atStopId?: string;
   feedTimestamp: number; // epoch seconds
+  upcoming?: { stopId: string; time: number }[]; // future stops (for arrivals boards)
 }
 
 /** A row persisted to the rolling-7-day SQLite history (§5). */
