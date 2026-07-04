@@ -9,7 +9,7 @@ import { PathLayer, ScatterplotLayer } from "@deck.gl/layers";
 import { SimpleMeshLayer } from "@deck.gl/mesh-layers";
 import type { PickingInfo } from "@deck.gl/core";
 import { distToLonLat, bearingAt, type Shape } from "./geo.ts";
-import { trainMesh } from "./mesh.ts";
+import { trainMesh, busMesh } from "./mesh.ts";
 
 const HOST = location.hostname || "localhost";
 const HTTP = `http://${HOST}:8080`;
@@ -34,7 +34,10 @@ const hex2rgb = (h: string): [number, number, number] => {
 let shapes: Record<string, Shape> = {};
 let routes: Record<string, RouteInfo> = {};
 const vehicles = new Map<string, Vehicle>();
+interface Bus { id: string; lon: number; lat: number; cLon: number; cLat: number; bearing: number; speed: number; route: string; color: [number, number, number]; }
+const buses = new Map<string, Bus>();
 const MESH = trainMesh();
+const BUS_MESH = busMesh();
 const statEl = document.getElementById("stat")!;
 const tipEl = document.getElementById("tooltip")!;
 
@@ -167,7 +170,30 @@ function trainLayers() {
   ];
 }
 
-function updateLayers() { overlay.setProps({ layers: [...staticLayers, ...trainLayers()] }); }
+function busLayers() {
+  const data = [...buses.values()];
+  return [
+    new ScatterplotLayer({
+      id: "bus-glow", data,
+      getPosition: (d: Bus) => [d.lon, d.lat],
+      getFillColor: (d: Bus) => [...d.color, 220] as [number, number, number, number],
+      getRadius: 20, radiusMinPixels: 2, radiusMaxPixels: 7, pickable: true,
+      updateTriggers: { getPosition: performance.now() },
+      parameters: { depthTest: false },
+    }),
+    new SimpleMeshLayer({
+      id: "buses", data, mesh: BUS_MESH as any,
+      getPosition: (d: Bus) => [d.lon, d.lat],
+      getColor: (d: Bus) => d.color,
+      getOrientation: (d: Bus) => [0, 90 - d.bearing, 90],
+      sizeScale: 2.5, material: false, pickable: true,
+      updateTriggers: { getPosition: performance.now(), getOrientation: performance.now() },
+      parameters: { depthTest: false },
+    }),
+  ];
+}
+
+function updateLayers() { overlay.setProps({ layers: [...staticLayers, ...trainLayers(), ...busLayers()] }); }
 
 // --- animation: dead-reckon anchor forward (boosted) + ease render toward it ---
 let lastT = performance.now();
@@ -192,6 +218,17 @@ function frame(now: number) {
         v.angle = bearingAt(shape, v.dist);
       } catch { /* skip one bad vehicle */ }
     }
+    for (const b of buses.values()) {
+      try {
+        const d = b.speed * SPEED_BOOST * dt; // meters along bearing
+        const br = (b.bearing * Math.PI) / 180;
+        b.lat += (d * Math.cos(br)) / 111320;
+        b.lon += (d * Math.sin(br)) / (111320 * Math.cos((b.lat * Math.PI) / 180));
+        const kc = Math.min(1, dt / 1.5); // absorb GPS correction smoothly
+        b.lon += b.cLon * kc; b.cLon -= b.cLon * kc;
+        b.lat += b.cLat * kc; b.cLat -= b.cLat * kc;
+      } catch { /* skip a bad bus */ }
+    }
     updateLayers();
     drawBloom();
   } catch (e) {
@@ -215,8 +252,9 @@ function drawBloom() {
 }
 
 function onHover(info: PickingInfo) {
-  const v = info.object as Vehicle | undefined;
-  if (v && (info.layer?.id === "trains" || info.layer?.id === "train-glow")) {
+  const id = info.layer?.id;
+  if (info.object && (id === "trains" || id === "train-glow")) {
+    const v = info.object as Vehicle;
     const c = routes[routeOfShape(v.shapeId)];
     tipEl.style.display = "block";
     tipEl.style.left = info.x + 14 + "px";
@@ -226,6 +264,14 @@ function onHover(info: PickingInfo) {
       `<b>${v.route} train</b><br>` +
       (v.nextStopName ? `→ ${v.nextStopName}` : "en route") +
       `<br><span style="opacity:.6">${(v.speed * 2.237).toFixed(0)} mph</span>`;
+  } else if (info.object && (id === "buses" || id === "bus-glow")) {
+    const b = info.object as Bus;
+    tipEl.style.display = "block";
+    tipEl.style.left = info.x + 14 + "px";
+    tipEl.style.top = info.y + 14 + "px";
+    tipEl.innerHTML =
+      `<span class="route-badge" style="background:#F0A830">${b.route}</span>` +
+      `<b>${b.route} bus</b><br><span style="opacity:.6">${(b.speed * 2.237).toFixed(0)} mph</span>`;
   } else {
     tipEl.style.display = "none";
   }
@@ -234,7 +280,20 @@ function onHover(info: PickingInfo) {
 let loggedFirst = false;
 function applyState(list: any[]) {
   const seen = new Set<string>();
+  const busSeen = new Set<string>();
   for (const s of list) {
+    if (s.mode === "bus" && s.pos) {
+      busSeen.add(s.id);
+      const eb = buses.get(s.id);
+      if (eb) {
+        eb.cLon = s.pos[0] - eb.lon; eb.cLat = s.pos[1] - eb.lat;
+        if (Math.abs(eb.cLon) > 0.02 || Math.abs(eb.cLat) > 0.02) { eb.lon = s.pos[0]; eb.lat = s.pos[1]; eb.cLon = 0; eb.cLat = 0; }
+        eb.bearing = s.bearing ?? eb.bearing; eb.speed = s.speed ?? eb.speed;
+      } else {
+        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], cLon: 0, cLat: 0, bearing: s.bearing ?? 0, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color) });
+      }
+      continue;
+    }
     if (!s.shapeId || !shapes[s.shapeId]) continue;
     seen.add(s.id);
     const ex = vehicles.get(s.id);
@@ -253,8 +312,9 @@ function applyState(list: any[]) {
     }
   }
   for (const id of [...vehicles.keys()]) if (!seen.has(id)) vehicles.delete(id);
-  statEl.textContent = `${vehicles.size} trains live · NYC subway`;
-  (window as any).__tt = { vehicles, shapes, map, overlay };
+  for (const id of [...buses.keys()]) if (!busSeen.has(id)) buses.delete(id);
+  statEl.textContent = `${vehicles.size} trains · ${buses.size} buses live · NYC`;
+  (window as any).__tt = { vehicles, buses, shapes, map, overlay };
 }
 
 function connect() {

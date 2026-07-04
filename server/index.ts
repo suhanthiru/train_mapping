@@ -9,6 +9,7 @@ import { readFile } from "node:fs/promises";
 import { join, extname, normalize } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { fetchNycVehicles } from "../ingest/nyc.ts";
+import { fetchNycBuses } from "../ingest/nyc-bus.ts";
 import { Interpolator, loadStatic } from "../core/interpolate.ts";
 import { History } from "../history/db.ts";
 import type { VehicleState, RawVehicle } from "../shared/types.ts";
@@ -35,23 +36,26 @@ const history = new History(join(DATA_DIR, "history.db"));
 
 let latest: VehicleState[] = [];
 let lastRaws: RawVehicle[] = [];
+let lastBuses: VehicleState[] = [];
 
-// Poll the live feed (slow): refresh predictions + record history.
+// Poll the live feeds (slow): subway predictions + bus GPS; record history.
 async function fetchTick() {
   try {
-    lastRaws = await fetchNycVehicles();
+    const [raws, buses] = await Promise.all([fetchNycVehicles(), fetchNycBuses()]);
+    lastRaws = raws;
+    lastBuses = buses;
     const now = Math.floor(Date.now() / 1000);
     history.record(now, interp.update(lastRaws, now));
-    console.log(`[server] feed: ${lastRaws.length} raw -> ${wss.clients.size} clients`);
+    console.log(`[server] feed: ${lastRaws.length} trains + ${lastBuses.length} buses -> ${wss.clients.size} clients`);
   } catch (e) {
     console.error("[server] feed error:", (e as Error).message);
   }
 }
 
-// Re-interpolate cached predictions with a fresh clock (fast) + broadcast.
+// Re-interpolate trains with a fresh clock (fast) + merge buses + broadcast.
 function pushTick() {
   const now = Math.floor(Date.now() / 1000);
-  latest = interp.update(lastRaws, now);
+  latest = [...interp.update(lastRaws, now), ...lastBuses];
   broadcast({ type: "state", city: "nyc", ts: now, vehicles: latest });
 }
 

@@ -85,11 +85,20 @@ npm run server        # serves built app + live data on http://localhost:8080
 - Verified headless each step (0 console errors, data-layer live). Pixel-level look still needs the
   user's real Chrome (my screenshot tool offline all session).
 
-## Vision gap still open (the "magnum opus" asks)
-- Buses driving on roads (NYC bus GTFS-rt has real GPS — good next, verifiable at data layer)
-- Trains visibly passing UNDER/OVER each other (needs per-segment elevation data — no clean source yet)
-- Fleet-accurate models (R46/R160, MARTA, MP89) — asset work
-- Click-to-focus route highlight (dim others); scrub/playback UI; MARTA + Paris adapters
+## Vision gap
+- [x] **Buses driving on roads** — OBA NYC bus GTFS-rt (real GPS, no key). ingest/nyc-bus.ts emits
+      VehicleState with `pos`; server merges into stream (242 trains + 236 buses). Frontend renders
+      amber bus meshes, dead-reckoned along bearing (isolated layer). Verified: 233 buses in app state.
+- Trains visibly passing UNDER/OVER each other — needs per-segment elevation data (no clean source; OSM
+  layer/tunnel tags would need extraction). BLOCKED on a data decision.
+- Fleet-accurate models (R46/R160, MARTA, MP89) — asset work; low ROI while I can't see pixels.
+- Click-to-focus route highlight; scrub/playback UI (history DB ready) — frontend, need pixel verification.
+- MARTA + Paris adapters — need free API keys from the user.
+
+## Edge of autonomous scope
+Trains + motion + 3D city + arrivals + buses are built & data-verified. Most remaining asks now need
+the user: (a) eyes on pixels (my screenshot tool offline all session), (b) MARTA/Paris API keys,
+(c) a call on elevation data. Good point for a status/handoff report.
 
 ## Blockers encountered
 _(none — all Phase 1 data dependencies verified; backend fully working against live data.)_

@@ -12,10 +12,11 @@ export interface VehicleState {
   mode: Mode;
   route: string; // "A", "RER B", "MARTA Red"
   color: string; // hex, real official agency color
-  shapeId: string | null; // null => straight-line fallback (§6.6)
-  dist: number; // meters along shape — backend's computed truth
+  shapeId: string | null; // null => positioned by `pos` (buses) or straight-line fallback
+  dist: number; // meters along shape — backend's computed truth (trains)
   speed: number; // m/s, for client-side tween
   bearing?: number;
+  pos?: [number, number]; // [lon,lat] direct position (buses have GPS, no shape)
   elevation: Elevation;
   nextStop?: string;
   nextStopName?: string;
