@@ -210,3 +210,22 @@ analytics.db actively accumulating. No git commits (user commits themselves).
 is the trip id (changes when a train finishes its trip) — fine for spatio-temporal
 crowding analytics, but not a stable per-physical-train identity across trips (GTFS-rt
 doesn't expose that for NYC anyway).
+
+---
+
+# Analytics roadmap build (2026-07-05) — branch `overnight-build`
+
+5-phase build on top of the prediction ledger. Local per-phase commits (no push). Full plan in the session plan file.
+
+## Done + verified + committed
+- **Phase 1 — data future-proofing** (`ee14890`): `segments` edge/training table (`buildSegments`), DuckDB→Parquet exports (`history/export.ts`, `npm run export:*`), graph nodes/edges (401 nodes, 318 edges, 0 orphans), `data/SCHEMA.md`.
+- **Phase 2 — Rust Kalman sidecar** (`92f63d8`): portable Rust toolchain installed (rustup GNU, no admin). `kalman-rs/` 1D constant-velocity filter service (:8092). Node wiring (pre-clamp `measuredDist` → async filter call → `uncertainty`, clamp fallback). Frontend `K` halo toggle. Verified live: 513 trains, **median 2m** position innovation, teleports damped, graceful degrade confirmed.
+- **Phase 3 — XGBoost ETA** (`1282289`): `train_eta.py` (xgboost+polars) → `app.py` FastAPI (:8091, `/predict`, `/feature-importance`, `/docs`, ported `/context`+`/weather-score`). In-sample MAE 15.3s vs 29.4s predict-the-mean.
+- **Phase 4 — dashboard** (`5dd3b6e`): `dashboard/` Chart.js site (:4174), system + per-train modes; `accuracy_snapshots` + new backend read endpoints. All panels render live.
+- **Phase 5 — Docker** (`29fc6a1`): Dockerfile per service + `docker-compose.yml` + `.dockerignore`; Go paths env-configurable. Verified: all 5 images build (Go 31MB distroless, Rust 115MB), `docker compose up` runs the whole stack healthy, cross-container networking works, `./data` volume persisted the existing ledger (74.7k predictions).
+
+## Honest limitations
+- **Kalman**: tracks position tightly (2m) but its speed-innovation (~6–9 m/s) ≈ the 5.72 m/s clamp baseline — value is smoothing + uncertainty, not speed accuracy.
+- **ONNX dropped**: `onnx` pip package won't install on Store-Python (Windows MAX_PATH, needs admin). Serve native XGBoost via FastAPI instead.
+- **ETA model accuracy is thin** (~1 day of mostly-unique segments) — the pipeline is what's built; accuracy improves as the ledger matures.
+- Headless preview throttles rAF, so charts/halos were verified via data + DOM inspection, not screenshots.
