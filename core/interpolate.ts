@@ -49,8 +49,20 @@ export function loadStatic(dir: string): StaticData {
   };
 }
 
+const MAX_SPEED = 22; // m/s hard ceiling — nothing on the subway network moves faster
+const CONTINUITY_PRUNE_MS = 15 * 60 * 1000; // drop tracking for vehicles unseen this long
+
 export class Interpolator {
   private shapeStopSet = new Map<string, Set<string>>(); // shapeId -> its stop ids, cached
+  // Continuity memory: the raw per-tick formulas below are recomputed from
+  // scratch each call using feed-timestamp-relative "age", which resets every
+  // ~30s poll and jumps whenever anchor stops change — verified live to cause
+  // -218m snaps and +300m+ (77-86 m/s) teleports mid-trip. This map remembers
+  // each vehicle's last real-world tick time + position and clamps every new
+  // computation to be monotonic and rate-bounded, independent of the formulas'
+  // own (unreliable) sense of elapsed time.
+  private lastSeen = new Map<string, { dist: number; ts: number; shapeId: string }>();
+  private lastPrune = 0;
 
   constructor(private s: StaticData, private city: "nyc" = "nyc") {}
 
@@ -146,6 +158,11 @@ export class Interpolator {
   }
 
   update(raws: RawVehicle[], now = Math.floor(Date.now() / 1000)): VehicleState[] {
+    if (Date.now() - this.lastPrune > CONTINUITY_PRUNE_MS) {
+      this.lastPrune = Date.now();
+      const cutoff = now - CONTINUITY_PRUNE_MS / 1000;
+      for (const [id, s] of this.lastSeen) if (s.ts < cutoff) this.lastSeen.delete(id);
+    }
     const out: VehicleState[] = [];
     for (const v of raws) {
       const shapeId = this.resolveShapeId(v);
@@ -188,11 +205,26 @@ export class Interpolator {
         continue; // nothing to anchor to
       }
 
+      // Continuity clamp: whatever the formulas above computed, never let the
+      // OUTWARD-FACING position regress or jump faster than physically
+      // possible since we last placed this vehicle. This is what actually
+      // fixes the measured -218m snaps / +300m+ teleports — it's a hard
+      // backstop independent of why the raw formula misbehaved.
+      const vid = `${this.city}:${v.tripId}`;
+      const prevSeen = this.lastSeen.get(vid);
+      if (prevSeen && prevSeen.shapeId === shapeId) {
+        const dtReal = Math.max(0.5, now - prevSeen.ts);
+        const maxAdvance = MAX_SPEED * dtReal;
+        if (dist < prevSeen.dist) dist = prevSeen.dist;
+        else if (dist > prevSeen.dist + maxAdvance) dist = prevSeen.dist + maxAdvance;
+      }
+      this.lastSeen.set(vid, { dist, ts: now, shapeId });
+
       // next-stop label: use the feed's if present, else derive from geometry
       const nextStopId = v.toStopId ?? this.nextStopAfter(shapeId, dist) ?? undefined;
       const stale = now - v.feedTimestamp > 120;
       out.push({
-        id: `${this.city}:${v.tripId}`,
+        id: vid,
         city: this.city,
         mode: "subway",
         route: route?.shortName ?? v.routeId,

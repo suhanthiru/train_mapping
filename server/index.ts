@@ -38,24 +38,31 @@ let latest: VehicleState[] = [];
 let lastRaws: RawVehicle[] = [];
 let lastBuses: VehicleState[] = [];
 
-// Poll the live feeds (slow): subway predictions + bus GPS; record history.
+// Poll the live feeds (slow): just refreshes raw predictions/GPS. Does NOT
+// call interp.update() — that would silently advance the same continuity
+// state pushTick's clamp depends on, letting stacked "invisible" advances
+// between broadcasts add up to more distance than any single broadcast
+// interval should allow (verified live: this caused ~29 m/s implied jumps
+// between consecutive pushes despite each individual step being clamped).
 async function fetchTick() {
   try {
     const [raws, buses] = await Promise.all([fetchNycVehicles(), fetchNycBuses()]);
     lastRaws = raws;
     lastBuses = buses;
-    const now = Math.floor(Date.now() / 1000);
-    history.record(now, interp.update(lastRaws, now));
     console.log(`[server] feed: ${lastRaws.length} trains + ${lastBuses.length} buses -> ${wss.clients.size} clients`);
   } catch (e) {
     console.error("[server] feed error:", (e as Error).message);
   }
 }
 
-// Re-interpolate trains with a fresh clock (fast) + merge buses + broadcast.
+// Single source of truth: re-interpolate + broadcast + record history from
+// the SAME computation, so continuity is judged only against what viewers
+// actually see.
 function pushTick() {
   const now = Math.floor(Date.now() / 1000);
-  latest = [...interp.update(lastRaws, now), ...lastBuses];
+  const trains = interp.update(lastRaws, now);
+  latest = [...trains, ...lastBuses];
+  history.record(now, trains);
   broadcast({ type: "state", city: "nyc", ts: now, vehicles: latest });
 }
 

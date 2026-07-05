@@ -17,7 +17,7 @@ const WS = `ws://${HOST}:8080`;
 const SPEED_BOOST = 1.0; // real rate — no overshoot, so no snap-back/reversing
 
 interface RouteInfo { id: string; color: string; textColor: string; shortName: string }
-interface Stop { id: string; name: string; pos: [number, number] }
+interface Stop { id: string; name: string; pos: [number, number]; parent?: string }
 interface Vehicle {
   id: string; shapeId: string;
   dist: number; correct: number; speed: number; // correct = pending drift to absorb
@@ -115,7 +115,7 @@ const map = new maplibregl.Map({
 });
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
 
-const overlay = new MapboxOverlay({ interleaved: true, pickingRadius: 8, layers: [], onHover, onClick });
+const overlay = new MapboxOverlay({ interleaved: true, pickingRadius: 5, layers: [], onHover, onClick });
 map.addControl(overlay as any);
 
 // warm/cool lighting on the extrusions
@@ -363,6 +363,12 @@ function onHover(info: PickingInfo) {
     tipEl.innerHTML =
       `<span class="route-badge" style="background:#F0A830">${b.route}</span>` +
       `<b>${b.route} bus</b><br><span style="opacity:.6">${(b.speed * 2.237).toFixed(0)} mph</span>`;
+  } else if (info.object && id === "stations") {
+    const s = info.object as Stop;
+    tipEl.style.display = "block";
+    tipEl.style.left = info.x + 14 + "px";
+    tipEl.style.top = info.y + 14 + "px";
+    tipEl.innerHTML = `<b>${s.name}</b><br><span style="opacity:.6">station · click for arrivals</span>`;
   } else {
     tipEl.style.display = "none";
   }
@@ -442,7 +448,10 @@ async function main() {
   ]);
   shapes = sh; routes = ro;
   linePaths = Object.values(shapes).map((s) => ({ path: s.pts, color: shapeColor(s.id) }));
-  stationPts = (Object.values(st) as Stop[]).filter((s) => s.pos && s.pos[0]);
+  // dedupe: keep only parent-level stations (992/1488 records were child
+  // platform stops stacked at the exact same coordinates as their parent —
+  // that made clicking pick a random one of up to 3 overlapping dots)
+  stationPts = (Object.values(st) as Stop[]).filter((s) => s.pos && s.pos[0] && !s.parent);
   buildStatic();
   console.log(`[init] ${linePaths.length} lines, ${stationPts.length} stations`);
   connect();
