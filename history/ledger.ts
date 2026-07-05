@@ -33,6 +33,7 @@ export class PredictionLedger {
   private insPred;
   private insActual;
   private insCond;
+  private insModelPred;
   private insAccSnap;
   // in-memory change-detection: "tripId|stopId" -> last logged pred_arrival
   private lastPred = new Map<string, number>();
@@ -113,6 +114,10 @@ export class PredictionLedger {
     this.insCond = this.db.prepare(
       `INSERT INTO conditions (ts, weather_score, temp_f, precipitating, conditions) VALUES (?, ?, ?, ?, ?)`
     );
+    this.insModelPred = this.db.prepare(
+      `INSERT INTO predictions (trip_id, stop_id, route_id, pred_arrival, observed_at, source)
+       VALUES (?, ?, ?, ?, ?, 'model-v1')`
+    );
     this.insAccSnap = this.db.prepare(
       `INSERT INTO accuracy_snapshots (ts, source, lead_label, n, mae_sec, bias_sec) VALUES (?, ?, ?, ?, ?, ?)`
     );
@@ -142,6 +147,31 @@ export class PredictionLedger {
             v.occPct ?? null
           );
         }
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
+  /**
+   * Log the ETA model's own arrival-time predictions (source='model-v1'), in
+   * the same table/shape as the feed's, so accuracyByLeadTime()/accuracyTrend()
+   * grade them identically for a head-to-head backtest. Change-detected with a
+   * separate key namespace so it can't collide with the feed's own tracking.
+   */
+  recordModelPredictions(rows: { tripId: string; stopId: string; routeId: string; predArrival: number; observedAt: number }[]): void {
+    this.db.exec("BEGIN");
+    try {
+      for (const r of rows) {
+        const key = `model:${r.tripId}|${r.stopId}`;
+        const prev = this.lastPred.get(key);
+        if (prev !== undefined && Math.abs(r.predArrival - prev) <= PRED_CHANGE_THRESHOLD_S) {
+          continue; // unchanged belief — skip duplicate row
+        }
+        this.lastPred.set(key, r.predArrival);
+        this.insModelPred.run(r.tripId, r.stopId, r.routeId, r.predArrival, r.observedAt);
       }
       this.db.exec("COMMIT");
     } catch (e) {

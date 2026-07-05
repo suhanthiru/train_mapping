@@ -63,6 +63,13 @@
         <div class="sub">how far off the agency feed's arrival predictions are</div>
         <div class="chartbox"><canvas id="acc"></canvas></div>
       </div>
+      <div class="panel" style="grid-column: span 2;">
+        <h2>Prediction showdown — feed vs. model</h2>
+        <div class="sub">head-to-head grading: agency feed (gtfs-rt) vs. our XGBoost model (model-v1), same ledger, same rules</div>
+        <div class="cards" id="h2h-cards" style="margin-bottom:10px;"></div>
+        <div class="chartbox"><canvas id="h2h"></canvas></div>
+        <div class="chartbox" style="height:150px;"><canvas id="h2h-bias"></canvas></div>
+      </div>
       <div class="panel">
         <h2>Accuracy over time</h2>
         <div class="sub">MAE trend from periodic snapshots (accrues as it runs)</div>

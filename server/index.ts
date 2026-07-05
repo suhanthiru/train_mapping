@@ -43,6 +43,7 @@ let latest: VehicleState[] = [];
 let lastRaws: RawVehicle[] = [];
 let lastBuses: VehicleState[] = [];
 let kalmanInFlight = false; // guard: never stack overlapping Kalman round-trips
+let lastWeatherScore = 0; // reused by modelPredictTick so it doesn't need its own DB/HTTP round-trip
 
 // Poll the live feeds (slow): just refreshes raw predictions/GPS. Does NOT
 // call interp.update() — that would silently advance the same continuity
@@ -65,6 +66,7 @@ async function fetchTick() {
     } catch (e) {
       console.error("[server] ledger error:", (e as Error).message);
     }
+    await modelPredictTick(lastRaws);
   } catch (e) {
     console.error("[server] feed error:", (e as Error).message);
   }
@@ -78,6 +80,7 @@ async function weatherTick() {
     const r = await fetch(`${ANALYTICS_PY}/weather-score`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const w = (await r.json()) as { severity?: number; tempF?: number; precipitating?: boolean; conditions?: string };
+    lastWeatherScore = w.severity ?? 0;
     ledger.recordConditions(
       Math.floor(Date.now() / 1000),
       w.severity ?? null,
@@ -87,6 +90,77 @@ async function weatherTick() {
     );
   } catch (e) {
     console.error("[server] weather sample skipped:", (e as Error).message);
+  }
+}
+
+// Bridge the ETA model's per-segment duration predictions into arrival-time
+// predictions, logged as source='model-v1' in the SAME ledger table the feed's
+// predictions use — so accuracyByLeadTime()/accuracyTrend() grade both
+// identically for the feed-vs-model head-to-head. For each vehicle, chain the
+// model's hop-by-hop duration guesses (anchor -> upcoming[0] -> upcoming[1]...)
+// into cumulative arrival times, in one batched call (mirrors kalman-rs's
+// POST /filter batch shape) so a tick with hundreds of trains is one request.
+async function modelPredictTick(raws: RawVehicle[]): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  const nowDate = new Date(now * 1000);
+  const hour = nowDate.getHours();
+  const dow = nowDate.getDay();
+
+  interface HopReq { id: string; route_id: string; from_stop: string; to_stop: string; hour: number; dow: number; weather_score: number; occ_pct: number }
+  interface VehHops { tripId: string; routeId: string; feedTimestamp: number; hopIds: string[]; targetStops: string[] }
+
+  const hopReqs: HopReq[] = [];
+  const vehHops: VehHops[] = [];
+
+  for (const v of raws) {
+    if (!v.upcoming?.length) continue;
+    const anchor = v.atStopId ?? v.toStopId ?? v.fromStopId;
+    if (!anchor) continue; // nothing to chain the first hop from — skip this tick
+    const hopIds: string[] = [];
+    const targetStops: string[] = [];
+    for (let i = 0; i < v.upcoming.length; i++) {
+      const to = v.upcoming[i].stopId;
+      if (!to) continue;
+      const from = i === 0 ? anchor : v.upcoming[i - 1].stopId;
+      const id = `${v.tripId}|${i}`;
+      hopReqs.push({
+        id, route_id: v.routeId, from_stop: from, to_stop: to,
+        hour, dow, weather_score: lastWeatherScore, occ_pct: v.occPct ?? 0,
+      });
+      hopIds.push(id);
+      targetStops.push(to);
+    }
+    if (hopIds.length) vehHops.push({ tripId: v.tripId, routeId: v.routeId, feedTimestamp: v.feedTimestamp, hopIds, targetStops });
+  }
+  if (!hopReqs.length) return;
+
+  try {
+    const r = await fetch(`${ANALYTICS_PY}/predict-batch`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(hopReqs),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) return; // model not trained yet, or service down — skip quietly
+    const preds = (await r.json()) as { id: string; predicted_travel_sec: number }[];
+    const byId = new Map(preds.map((p) => [p.id, p.predicted_travel_sec]));
+
+    const rows: { tripId: string; stopId: string; routeId: string; predArrival: number; observedAt: number }[] = [];
+    for (const veh of vehHops) {
+      let cumulative = 0;
+      for (let i = 0; i < veh.hopIds.length; i++) {
+        const d = byId.get(veh.hopIds[i]);
+        if (d == null) break; // missing prediction — stop chaining further stops for this trip
+        cumulative += d;
+        rows.push({
+          tripId: veh.tripId, stopId: veh.targetStops[i], routeId: veh.routeId,
+          predArrival: now + Math.round(cumulative), observedAt: veh.feedTimestamp,
+        });
+      }
+    }
+    ledger.recordModelPredictions(rows);
+  } catch (e) {
+    console.error("[server] model prediction skipped:", (e as Error).message);
   }
 }
 

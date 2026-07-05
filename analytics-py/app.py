@@ -17,6 +17,7 @@ import xgboost as xgb
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 import weather
 import nyc311
@@ -90,6 +91,15 @@ def feature_importance():
     }
 
 
+def _feature_row(enc, route_id, from_stop, to_stop, hour, dow, weather_score, occ_pct):
+    return [
+        enc["route_id"].get(str(route_id), -1),
+        enc["from_stop"].get(str(from_stop), -1),
+        enc["to_stop"].get(str(to_stop), -1),
+        float(hour), float(dow), float(weather_score), float(occ_pct),
+    ]
+
+
 @app.get("/predict")
 def predict(
     route_id: str,
@@ -103,15 +113,40 @@ def predict(
     if _model is None or _feats is None:
         return JSONResponse({"error": "model not trained yet — run train_eta.py"}, status_code=503)
     enc = _feats["encoders"]
-    row = [
-        enc["route_id"].get(str(route_id), -1),
-        enc["from_stop"].get(str(from_stop), -1),
-        enc["to_stop"].get(str(to_stop), -1),
-        float(hour), float(dow), float(weather_score), float(occ_pct),
-    ]
+    row = _feature_row(enc, route_id, from_stop, to_stop, hour, dow, weather_score, occ_pct)
     X = np.array([row], dtype=np.float32)
     pred = float(_model.predict(X)[0])
     return {"predicted_travel_sec": round(pred, 1), "source": "model-v1"}
+
+
+class HopRequest(BaseModel):
+    id: str  # caller-defined key (e.g. "tripId|stopId|hopIndex") echoed back for mapping
+    route_id: str
+    from_stop: str
+    to_stop: str
+    hour: int = 12
+    dow: int = 1
+    weather_score: float = 0.0
+    occ_pct: float = 0.0
+
+
+@app.post("/predict-batch")
+def predict_batch(hops: list[HopRequest]):
+    """Batch segment-duration predictions, one model.predict() call for the
+    whole tick's worth of hops — mirrors kalman-rs's POST /filter batch shape.
+    Used by the server to chain per-hop durations into arrival-time predictions
+    (source='model-v1') for the head-to-head backtest vs the feed."""
+    if _model is None or _feats is None:
+        return JSONResponse({"error": "model not trained yet — run train_eta.py"}, status_code=503)
+    if not hops:
+        return []
+    enc = _feats["encoders"]
+    X = np.array(
+        [_feature_row(enc, h.route_id, h.from_stop, h.to_stop, h.hour, h.dow, h.weather_score, h.occ_pct) for h in hops],
+        dtype=np.float32,
+    )
+    preds = _model.predict(X)
+    return [{"id": h.id, "predicted_travel_sec": round(float(p), 1)} for h, p in zip(hops, preds)]
 
 
 if __name__ == "__main__":

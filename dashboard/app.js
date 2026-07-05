@@ -63,6 +63,63 @@ async function loadAccuracy(d) {
     options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: axes("seconds") },
   });
 }
+
+// Dedicated feed-vs-model comparison: same lead-time buckets, both sources
+// graded identically, rendered side by side (MAE) plus a bias chart (which
+// way each source tends to be wrong — late = positive, early = negative).
+async function loadHeadToHead() {
+  const ALL_LABELS = ["0-1 min", "1-2 min", "2-5 min", "5-10 min", "10+ min"];
+  let feed, model;
+  try {
+    [feed, model] = await Promise.all([
+      getJSON(`${BACKEND}/api/prediction-accuracy?source=gtfs-rt`),
+      getJSON(`${BACKEND}/api/prediction-accuracy?source=model-v1`),
+    ]);
+  } catch {
+    document.getElementById("h2h-cards").innerHTML = '<div class="empty">backend not reachable</div>';
+    return;
+  }
+  const byLabel = (buckets) => Object.fromEntries((buckets || []).map((b) => [b.leadLabel, b]));
+  const fb = byLabel(feed.buckets), mb = byLabel(model.buckets);
+  const modelN = model.buckets?.reduce((s, b) => s + b.n, 0) ?? 0;
+  const feedN = feed.buckets?.reduce((s, b) => s + b.n, 0) ?? 0;
+
+  cards(document.getElementById("h2h-cards"), [
+    { k: "feed graded predictions", v: feedN.toLocaleString() },
+    { k: "model graded predictions", v: modelN.toLocaleString() },
+    { k: "model status", v: modelN > 0 ? "collecting" : "no data yet" },
+  ]);
+
+  if (modelN === 0) {
+    charts.h2h?.destroy(); charts["h2h-bias"]?.destroy();
+    document.getElementById("h2h").parentElement.innerHTML = '<div class="empty">model-v1 predictions not graded yet — the model needs to log predictions and then trains need to actually arrive (a few minutes)</div>';
+    return;
+  }
+
+  const labels = ALL_LABELS.filter((l) => (fb[l]?.n ?? 0) > 0 || (mb[l]?.n ?? 0) > 0);
+  draw("h2h", {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        { label: "feed (gtfs-rt) MAE", data: labels.map((l) => fb[l]?.maeSec ?? null), backgroundColor: ACCENT, borderRadius: 4 },
+        { label: "model (model-v1) MAE", data: labels.map((l) => mb[l]?.maeSec ?? null), backgroundColor: "#f0902f", borderRadius: 4 },
+      ],
+    },
+    options: { responsive: true, maintainAspectRatio: false, scales: axes("MAE (s)") },
+  });
+  draw("h2h-bias", {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        { label: "feed bias (+ = late)", data: labels.map((l) => fb[l]?.biasSec ?? null), backgroundColor: ACCENT, borderRadius: 4 },
+        { label: "model bias (+ = late)", data: labels.map((l) => mb[l]?.biasSec ?? null), backgroundColor: "#f0902f", borderRadius: 4 },
+      ],
+    },
+    options: { responsive: true, maintainAspectRatio: false, scales: axes("bias (s)") },
+  });
+}
 async function loadTrend() {
   const d = await getJSON(`${BACKEND}/api/accuracy-trend?source=gtfs-rt`);
   const pts = d.points || [];
@@ -148,7 +205,7 @@ document.getElementById("loadtrip").onclick = loadTrip;
 async function refresh() {
   try {
     const d = await loadCounts();
-    await Promise.all([loadKalman(), loadAccuracy(d), loadTrend(), loadImportance(), loadFeature()]);
+    await Promise.all([loadKalman(), loadAccuracy(d), loadHeadToHead(), loadTrend(), loadImportance(), loadFeature()]);
     document.getElementById("status").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) {
     document.getElementById("status").textContent = "error: " + e.message;
