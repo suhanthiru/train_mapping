@@ -110,6 +110,7 @@ const map = new maplibregl.Map({
   bearing: 18,
   antialias: false, // deck AA's its own layers; extrusion AA is brutal on integrated GPUs
   pixelRatio: Math.min(window.devicePixelRatio || 1, 1.25), // cap fill-rate on high-DPI displays
+  preserveDrawingBuffer: true, // bloom reads this canvas; without it reads catch a cleared buffer (screen blink)
   maxPitch: 75,
 });
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-right");
@@ -121,6 +122,11 @@ map.addControl(overlay as any);
 map.on("style.load", () => {
   try { map.setLight({ anchor: "viewport", color: "#9fb8d8", intensity: 0.35, position: [1.2, 200, 40] }); } catch {}
 });
+
+// Copy the bloom overlay inside MapLibre's own render event: the WebGL buffer is
+// always fresh/valid here, and the bloom stays perfectly in sync with camera
+// motion (fixes both the dark screen-blink and the lagging-blur ghosting).
+map.on("render", () => { if (bloomOn) drawBloom(); });
 
 // --- click handling via deck picking: train -> journey timeline, station -> arrivals ---
 const arrivalsEl = document.getElementById("arrivals")!;
@@ -281,13 +287,14 @@ function frame(now: number) {
         const shape = shapes[v.shapeId];
         if (!shape || !shape.cum?.length) continue;
         const total = shape.cum[shape.cum.length - 1];
-        v.dist += v.speed * SPEED_BOOST * dt; // continuous glide, never freezes mid-track
-        if (v.correct) {
-          const step = v.correct * Math.min(1, dt / 1.2); // absorb drift over ~1.2s
-          v.dist += step; v.correct -= step;
-        }
+        // Converging motion: base speed + drift absorbed over ~2s as a gentle
+        // speed-up/slow-down. Forward-only per frame — no sprint-freeze sawtooth,
+        // no backward glide.
+        const catchup = v.correct * Math.min(1, dt / 2);
+        const step = Math.max(0, v.speed * SPEED_BOOST * dt + catchup);
+        v.dist += step;
+        v.correct -= catchup;
         if (v.dist > total) v.dist = total;
-        else if (v.dist < 0) v.dist = 0;
         const [lon, lat] = distToLonLat(shape, v.dist);
         v.position = [lon, lat, 0];
         v.angle = bearingAt(shape, v.dist);
@@ -304,7 +311,6 @@ function frame(now: number) {
     if (!pausePush && now - lastLayerPush > 100) {
       lastLayerPush = now;
       updateLayers();
-      if (bloomOn) drawBloom();
     }
     fpsCount++;
     if (now - fpsLast > 500) {
@@ -393,9 +399,9 @@ function applyState(list: any[]) {
     if (ex) {
       ex.route = s.route; ex.nextStopName = s.nextStopName;
       const drift = s.dist - ex.dist;
-      if (Math.abs(drift) > 1500) { ex.dist = s.dist; ex.correct = 0; ex.speed = s.speed; } // big desync: snap
-      else if (drift >= 0) { ex.correct = drift; ex.speed = s.speed; } // behind truth: catch up smoothly
-      else { ex.correct = 0; ex.speed = 0; } // ahead of truth: HOLD (trains never move backward)
+      if (Math.abs(drift) > 1500) { ex.dist = s.dist; ex.correct = 0; }
+      else ex.correct = drift; // signed; absorbed as gentle speed-up/slow-down in frame()
+      ex.speed = s.speed;
     } else {
       vehicles.set(s.id, {
         id: s.id, shapeId: s.shapeId, dist: s.dist, correct: 0, speed: s.speed,
