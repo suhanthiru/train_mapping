@@ -15,6 +15,7 @@ from typing import Optional
 import numpy as np
 import xgboost as xgb
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import weather
@@ -25,6 +26,9 @@ MODEL_PATH = os.path.join(HERE, "eta_model.json")
 FEATS_PATH = os.path.join(HERE, "eta_features.json")
 
 app = FastAPI(title="transit-analytics", version="0.2.0")
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
 
 _model: Optional[xgb.XGBRegressor] = None
 _feats: Optional[dict] = None

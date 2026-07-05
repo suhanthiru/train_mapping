@@ -1,0 +1,158 @@
+// Analytics dashboard (roadmap Phase 4). Reads the live services and renders
+// Chart.js panels. Decoupled from the 3D map — charts, not GPU.
+const BACKEND = "http://localhost:8080";
+const KALMAN = "http://localhost:8092";
+const ANALYTICS = "http://localhost:8091";
+
+const AX = "#8b98a5", GRID = "#1f2937", ACCENT = "#3FD8FF";
+Chart.defaults.color = AX;
+Chart.defaults.font.family = "system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+
+const charts = {};
+function draw(id, config) {
+  if (charts[id]) charts[id].destroy();
+  charts[id] = new Chart(document.getElementById(id), config);
+}
+async function getJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} -> ${r.status}`);
+  return r.json();
+}
+const axes = (yLabel) => ({
+  x: { grid: { color: GRID }, ticks: { autoSkip: true, maxRotation: 45 } },
+  y: { grid: { color: GRID }, title: { display: !!yLabel, text: yLabel } },
+});
+
+function cards(el, items) {
+  el.innerHTML = items
+    .map((i) => `<div class="card"><div class="k">${i.k}</div><div class="v">${i.v}</div></div>`)
+    .join("");
+}
+
+// ---- system panels ----
+async function loadCounts() {
+  const d = await getJSON(`${BACKEND}/api/prediction-accuracy`);
+  const c = d.counts || {};
+  cards(document.getElementById("counts"), [
+    { k: "predictions", v: (c.predictions ?? 0).toLocaleString() },
+    { k: "actuals", v: (c.actuals ?? 0).toLocaleString() },
+    { k: "segments", v: (c.segments ?? 0).toLocaleString() },
+    { k: "weather", v: (c.conditions ?? 0).toLocaleString() },
+  ]);
+  return d;
+}
+async function loadKalman() {
+  try {
+    const s = await getJSON(`${KALMAN}/stats`);
+    cards(document.getElementById("kalman"), [
+      { k: "tracked", v: s.tracked ?? 0 },
+      { k: "pos err (med)", v: `${(s.posInnovMedianM ?? 0).toFixed(1)}m` },
+      { k: "speed err (mean)", v: `${(s.speedInnovMeanMps ?? 0).toFixed(2)} m/s` },
+      { k: "vs baseline", v: "5.72 m/s" },
+    ]);
+  } catch {
+    document.getElementById("kalman").innerHTML = '<div class="empty">Kalman service (:8092) not reachable</div>';
+  }
+}
+async function loadAccuracy(d) {
+  const b = (d.buckets || []).filter((x) => x.n > 0);
+  if (!b.length) { charts.acc?.destroy(); return; }
+  draw("acc", {
+    type: "bar",
+    data: { labels: b.map((x) => x.leadLabel), datasets: [{ label: "MAE (s)", data: b.map((x) => x.maeSec), backgroundColor: ACCENT, borderRadius: 4 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: axes("seconds") },
+  });
+}
+async function loadTrend() {
+  const d = await getJSON(`${BACKEND}/api/accuracy-trend?source=gtfs-rt`);
+  const pts = d.points || [];
+  if (!pts.length) { charts.trend?.destroy(); return; }
+  // group by lead bucket -> line per bucket
+  const byLabel = {};
+  for (const p of pts) (byLabel[p.leadLabel] ??= []).push(p);
+  const times = [...new Set(pts.map((p) => p.ts))].sort();
+  const palette = ["#3FD8FF", "#7ed957", "#f0c040", "#f0902f", "#e53950"];
+  const ds = Object.entries(byLabel).map(([label, arr], i) => {
+    const m = new Map(arr.map((p) => [p.ts, p.maeSec]));
+    return { label, data: times.map((t) => m.get(t) ?? null), borderColor: palette[i % palette.length], spanGaps: true, tension: 0.3, pointRadius: 2 };
+  });
+  draw("trend", {
+    type: "line",
+    data: { labels: times.map((t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })), datasets: ds },
+    options: { responsive: true, maintainAspectRatio: false, scales: axes("MAE (s)") },
+  });
+}
+async function loadImportance() {
+  try {
+    const d = await getJSON(`${ANALYTICS}/feature-importance`);
+    const imp = d.importance || {};
+    const entries = Object.entries(imp).sort((a, b) => b[1] - a[1]);
+    if (!entries.length) throw new Error("empty");
+    draw("importance", {
+      type: "bar",
+      data: { labels: entries.map((e) => e[0]), datasets: [{ label: "gain", data: entries.map((e) => e[1]), backgroundColor: "#7ed957", borderRadius: 4 }] },
+      options: { indexAxis: "y", responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: axes("") },
+    });
+  } catch {
+    charts.importance?.destroy();
+  }
+}
+async function loadFeature() {
+  const f = document.getElementById("feature").value;
+  const d = await getJSON(`${BACKEND}/api/feature-stats?feature=${encodeURIComponent(f)}`);
+  const s = (d.stats || []).slice(0, 24);
+  if (!s.length) { charts.feat?.destroy(); return; }
+  draw("feat", {
+    type: "bar",
+    data: { labels: s.map((x) => x.value), datasets: [{ label: "avg travel (s)", data: s.map((x) => x.avgTravel), backgroundColor: ACCENT, borderRadius: 4 }] },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: axes("avg travel (s)") },
+  });
+}
+
+// ---- per-train ----
+async function loadTrip() {
+  const id = document.getElementById("tripid").value.trim();
+  if (!id) return;
+  const d = await getJSON(`${BACKEND}/api/trip-history?id=${encodeURIComponent(id)}`);
+  const segs = d.segments || [];
+  document.getElementById("trip-meta").textContent =
+    `${segs.length} segments · ${(d.predictions || []).length} prediction rows · ${(d.actuals || []).length} actual arrivals`;
+  if (segs.length) {
+    draw("trip-seg", {
+      type: "bar",
+      data: { labels: segs.map((s) => `${s.from_stop}→${s.to_stop}`), datasets: [{ label: "travel (s)", data: segs.map((s) => s.travel_sec), backgroundColor: ACCENT, borderRadius: 4 }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: axes("seconds") },
+    });
+    document.getElementById("trip-table").innerHTML =
+      `<table><thead><tr><th>from→to</th><th>travel</th><th>weather</th><th>occ</th><th>hr</th></tr></thead><tbody>` +
+      segs.map((s) => `<tr><td>${s.from_stop}→${s.to_stop}</td><td>${s.travel_sec}s</td><td>${s.weather_score ?? "–"}</td><td>${s.occ_status ?? "–"}</td><td>${s.hour}</td></tr>`).join("") +
+      `</tbody></table>`;
+  } else {
+    document.getElementById("trip-table").innerHTML = '<div class="empty">no segments recorded for that trip id yet</div>';
+    charts["trip-seg"]?.destroy();
+  }
+}
+
+// ---- mode switch + boot ----
+function setMode(m) {
+  document.getElementById("mode-system").classList.toggle("on", m === "system");
+  document.getElementById("mode-train").classList.toggle("on", m === "train");
+  document.getElementById("view-system").classList.toggle("hidden", m !== "system");
+  document.getElementById("view-train").classList.toggle("hidden", m !== "train");
+}
+document.getElementById("mode-system").onclick = () => setMode("system");
+document.getElementById("mode-train").onclick = () => setMode("train");
+document.getElementById("feature").onchange = loadFeature;
+document.getElementById("loadtrip").onclick = loadTrip;
+
+async function refresh() {
+  try {
+    const d = await loadCounts();
+    await Promise.all([loadKalman(), loadAccuracy(d), loadTrend(), loadImportance(), loadFeature()]);
+    document.getElementById("status").textContent = "updated " + new Date().toLocaleTimeString();
+  } catch (e) {
+    document.getElementById("status").textContent = "error: " + e.message;
+  }
+}
+refresh();
+setInterval(refresh, 15000);

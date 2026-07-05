@@ -181,6 +181,29 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // --- dashboard (Phase 4) read endpoints over the ledger ---
+  if (url === "/api/accuracy-trend") {
+    const source = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("source") ?? "gtfs-rt";
+    res.writeHead(200, { "Content-Type": "application/json" }).end(
+      JSON.stringify({ source, points: ledger.accuracyTrend(source) })
+    );
+    return;
+  }
+  if (url === "/api/feature-stats") {
+    const feature = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("feature") ?? "route_id";
+    res.writeHead(200, { "Content-Type": "application/json" }).end(
+      JSON.stringify({ feature, stats: ledger.featureStats(feature) })
+    );
+    return;
+  }
+  if (url === "/api/trip-history") {
+    const id = (new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("id") ?? "").replace(/^nyc:/, "");
+    res.writeHead(200, { "Content-Type": "application/json" }).end(
+      JSON.stringify({ tripId: id, ...ledger.tripHistory(id) })
+    );
+    return;
+  }
+
   // Live arrivals board for a station (matches both direction platforms).
   if (url === "/api/arrivals") {
     const stop = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("stop") ?? "";
@@ -253,6 +276,13 @@ server.listen(PORT, () => {
   setInterval(pushTick, PUSH_MS);
   weatherTick(); // sample once at boot, then on a slow timer
   setInterval(weatherTick, WEATHER_MS);
+  // Accuracy snapshots (Phase 4): trend the backtest over time for the dashboard.
+  const snap = () => {
+    try { ledger.recordAccuracySnapshot("gtfs-rt"); ledger.recordAccuracySnapshot("model-v1"); }
+    catch (e) { console.error("[server] accuracy snapshot failed:", (e as Error).message); }
+  };
+  snap();
+  setInterval(snap, 10 * 60_000);
   setInterval(() => {
     const removed = history.prune();
     if (removed) console.log(`[server] pruned ${removed} old history rows`);

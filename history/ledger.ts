@@ -33,6 +33,7 @@ export class PredictionLedger {
   private insPred;
   private insActual;
   private insCond;
+  private insAccSnap;
   // in-memory change-detection: "tripId|stopId" -> last logged pred_arrival
   private lastPred = new Map<string, number>();
 
@@ -89,6 +90,18 @@ export class PredictionLedger {
       CREATE INDEX IF NOT EXISTS idx_seg_route ON segments(route_id);
       CREATE INDEX IF NOT EXISTS idx_seg_stops ON segments(from_stop, to_stop);
       CREATE INDEX IF NOT EXISTS idx_seg_arrive ON segments(arrive_ts);
+
+      -- Periodic accuracy snapshots so the dashboard can trend accuracy over
+      -- time (one row per lead-time bucket per snapshot per source).
+      CREATE TABLE IF NOT EXISTS accuracy_snapshots (
+        ts         INTEGER NOT NULL,
+        source     TEXT NOT NULL,
+        lead_label TEXT NOT NULL,
+        n          INTEGER,
+        mae_sec    INTEGER,
+        bias_sec   INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_accsnap_ts ON accuracy_snapshots(ts);
     `);
     this.insPred = this.db.prepare(
       `INSERT INTO predictions (trip_id, stop_id, route_id, pred_arrival, observed_at, occ_status, occ_pct)
@@ -99,6 +112,9 @@ export class PredictionLedger {
     );
     this.insCond = this.db.prepare(
       `INSERT INTO conditions (ts, weather_score, temp_f, precipitating, conditions) VALUES (?, ?, ?, ?, ?)`
+    );
+    this.insAccSnap = this.db.prepare(
+      `INSERT INTO accuracy_snapshots (ts, source, lead_label, n, mae_sec, bias_sec) VALUES (?, ?, ?, ?, ?, ?)`
     );
   }
 
@@ -258,6 +274,7 @@ export class PredictionLedger {
     removed += Number(this.db.prepare("DELETE FROM actuals WHERE actual_arrival < ?").run(cutoff).changes ?? 0);
     removed += Number(this.db.prepare("DELETE FROM conditions WHERE ts < ?").run(cutoff).changes ?? 0);
     removed += Number(this.db.prepare("DELETE FROM segments WHERE arrive_ts < ?").run(cutoff).changes ?? 0);
+    removed += Number(this.db.prepare("DELETE FROM accuracy_snapshots WHERE ts < ?").run(cutoff).changes ?? 0);
     // forget stale change-detection keys so the map doesn't grow unbounded
     for (const [k, t] of this.lastPred) if (t < cutoff) this.lastPred.delete(k);
     return removed;
@@ -272,6 +289,71 @@ export class PredictionLedger {
       actuals: one("actuals"),
       conditions: one("conditions"),
       segments: one("segments"),
+    };
+  }
+
+  // ---- dashboard reads (Phase 4) ----
+
+  /** Snapshot the current accuracy curve per source, so it can be trended. */
+  recordAccuracySnapshot(source = "gtfs-rt", now = Math.floor(Date.now() / 1000)): void {
+    const buckets = this.accuracyByLeadTime(source);
+    this.db.exec("BEGIN");
+    try {
+      for (const b of buckets) {
+        if (b.n > 0) this.insAccSnap.run(now, source, b.leadLabel, b.n, b.maeSec, b.biasSec);
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
+  /** Accuracy over time from the snapshots (for the trend chart). */
+  accuracyTrend(source = "gtfs-rt"): { ts: number; leadLabel: string; maeSec: number; n: number }[] {
+    return this.db
+      .prepare(
+        `SELECT ts, lead_label AS leadLabel, mae_sec AS maeSec, n
+         FROM accuracy_snapshots WHERE source = ? ORDER BY ts`
+      )
+      .all(source) as any[];
+  }
+
+  /** Distribution of travel time by any one model feature (system-wide). */
+  featureStats(feature: string): { value: string; avgTravel: number; n: number }[] {
+    const allowed = ["route_id", "from_stop", "to_stop", "hour", "dow", "weather_score", "occ_status"];
+    if (!allowed.includes(feature)) return [];
+    return this.db
+      .prepare(
+        `SELECT CAST(${feature} AS TEXT) AS value, ROUND(AVG(travel_sec)) AS avgTravel, COUNT(*) AS n
+         FROM segments WHERE ${feature} IS NOT NULL
+         GROUP BY ${feature} ORDER BY n DESC LIMIT 40`
+      )
+      .all() as any[];
+  }
+
+  /** Everything known about one trip: its segments + the feed's prediction history. */
+  tripHistory(tripId: string): {
+    segments: any[];
+    predictions: any[];
+    actuals: any[];
+  } {
+    return {
+      segments: this.db
+        .prepare(
+          `SELECT from_stop, to_stop, travel_sec, weather_score, occ_status, hour, dow, arrive_ts
+           FROM segments WHERE trip_id = ? ORDER BY arrive_ts`
+        )
+        .all(tripId) as any[],
+      predictions: this.db
+        .prepare(
+          `SELECT stop_id, pred_arrival, observed_at FROM predictions
+           WHERE trip_id = ? ORDER BY observed_at LIMIT 500`
+        )
+        .all(tripId) as any[],
+      actuals: this.db
+        .prepare(`SELECT stop_id, actual_arrival FROM actuals WHERE trip_id = ? ORDER BY actual_arrival`)
+        .all(tripId) as any[],
     };
   }
 
