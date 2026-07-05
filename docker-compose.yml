@@ -1,0 +1,32 @@
+# One-command run of the whole polyglot stack: `docker compose up --build`.
+# Services talk over the default bridge network by name (backend, kalman-rs, …);
+# host ./data is a volume so the SQLite ledgers persist across restarts.
+services:
+  kalman-rs:
+    build: ./kalman-rs
+    ports: ["8092:8092"]
+
+  analytics-py:
+    build: ./analytics-py
+    ports: ["8091:8091"]
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    ports: ["8080:8080"]
+    volumes:
+      - ./data:/app/data
+      - ./web/dist:/app/web/dist:ro
+    depends_on: [kalman-rs, analytics-py]
+
+  analytics-go:
+    build: ./analytics-go
+    ports: ["8090:8090"]
+    volumes:
+      - ./data:/data
+    depends_on: [backend, analytics-py]
+
+  dashboard:
+    build: ./dashboard
+    ports: ["4174:4174"]

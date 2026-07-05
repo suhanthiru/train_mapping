@@ -3,9 +3,9 @@
 // analytics-py :8091) over CORS. Run: node dashboard/serve.mjs
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { join, extname, normalize, resolve } from "node:path";
+import { join, extname, normalize } from "node:path";
 
-const ROOT = resolve("D:/train_tracker/dashboard");
+const ROOT = import.meta.dirname; // this script's own dir — portable (native + Docker)
 const MIME = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".json": "application/json" };
 
 createServer(async (req, res) => {

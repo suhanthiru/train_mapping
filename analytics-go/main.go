@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -23,11 +24,22 @@ import (
 	"transit-analytics/internal/wsclient"
 )
 
-const nodeWSURL = "ws://localhost:8080"
-const dataDir = `D:\train_tracker\data\nyc`
-const dbPath = `D:\train_tracker\data\analytics.db`
-const httpAddr = ":8090"
-const pythonURL = "http://localhost:8091"
+// env-configurable (defaults keep native Windows running unchanged; Docker
+// overrides via service-name URLs + container paths — see docker-compose.yml).
+func env(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+
+var (
+	nodeWSURL = env("NODE_WS_URL", "ws://localhost:8080")
+	dataDir   = env("DATA_DIR", `D:\train_tracker\data\nyc`)
+	dbPath    = env("DB_PATH", `D:\train_tracker\data\analytics.db`)
+	httpAddr  = env("HTTP_ADDR", ":8090")
+	pythonURL = env("PYTHON_URL", "http://localhost:8091")
+)
 
 // resolvePosition returns [lon,lat] for a vehicle: buses have direct GPS
 // (`Pos`); trains resolve via their shape + distance-along-shape, mirroring
