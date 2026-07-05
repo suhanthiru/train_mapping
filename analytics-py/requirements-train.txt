@@ -1,0 +1,7 @@
+# Extra deps for the offline trainer (train_eta.py) only — not needed to serve.
+# ONNX export was planned but `onnx` won't install on Store-Python (Windows
+# MAX_PATH); we export native XGBoost instead, so onnx/onnxmltools are omitted.
+xgboost
+polars
+numpy
+scikit-learn

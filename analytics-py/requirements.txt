@@ -1,0 +1,6 @@
+# Runtime deps for the FastAPI analytics service (app.py).
+# (The stdlib weather.py / nyc311.py modules need nothing extra.)
+fastapi
+uvicorn
+xgboost
+numpy

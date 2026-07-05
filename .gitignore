@@ -27,11 +27,13 @@ __pycache__/
 .venv/
 venv/
 
-# ---- ml artifacts (regenerable from training) ----
+# ---- ml artifacts (regenerable via train_eta.py) ----
 *.onnx
 *.model
 *.pkl
 *.joblib
+analytics-py/eta_model.json
+analytics-py/eta_features.json
 
 # ---- assistant / tooling (keep local, out of the repo) ----
 .claude/
