@@ -108,6 +108,7 @@ async function main() {
   // Also build route_id + directionId -> representative shape for realtime
   // matching fallback (realtime trip_ids don't always match static ones).
   const routeDirShape: Record<string, string> = {};
+  const shapesByRouteDir: Record<string, Set<string>> = {}; // all variants (express+local), for shape matching
   for (const t of tripsRaw) {
     if (!t.shape_id) continue;
     trips[t.trip_id] = {
@@ -122,6 +123,7 @@ async function main() {
     const dir = m ? m[1] : Number(t.direction_id ?? 0) === 1 ? "S" : "N";
     const key = `${t.route_id}|${dir}`;
     if (!routeDirShape[key]) routeDirShape[key] = t.shape_id;
+    (shapesByRouteDir[key] ??= new Set()).add(t.shape_id);
   }
   console.log(`[nyc] trips: ${Object.keys(trips).length}`);
 
@@ -175,6 +177,9 @@ async function main() {
   write("trips.json", trips);
   write("routeDirShape.json", routeDirShape);
   write("shapeStops.json", shapeStops);
+  const shapesByRouteDirArr: Record<string, string[]> = {};
+  for (const [k, v] of Object.entries(shapesByRouteDir)) shapesByRouteDirArr[k] = [...v];
+  write("shapesByRouteDir.json", shapesByRouteDirArr);
   write("meta.json", {
     city: "nyc",
     generated: new Date().toISOString(),

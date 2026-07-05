@@ -33,6 +33,7 @@ interface StaticData {
   trips: Record<string, TripInfo>;
   routeDirShape: Record<string, string>;
   shapeStops: Record<string, { id: string; dist: number }[]>;
+  shapesByRouteDir: Record<string, string[]>;
 }
 
 export function loadStatic(dir: string): StaticData {
@@ -44,21 +45,64 @@ export function loadStatic(dir: string): StaticData {
     trips: rd("trips.json"),
     routeDirShape: rd("routeDirShape.json"),
     shapeStops: rd("shapeStops.json"),
+    shapesByRouteDir: rd("shapesByRouteDir.json"),
   };
 }
 
 export class Interpolator {
+  private shapeStopSet = new Map<string, Set<string>>(); // shapeId -> its stop ids, cached
+
   constructor(private s: StaticData, private city: "nyc" = "nyc") {}
 
+  private stopSetFor(shapeId: string): Set<string> {
+    let set = this.shapeStopSet.get(shapeId);
+    if (!set) {
+      set = new Set((this.s.shapeStops[shapeId] ?? []).map((e) => e.id));
+      this.shapeStopSet.set(shapeId, set);
+    }
+    return set;
+  }
+
+  /**
+   * Resolve the train's TRUE track (express vs local share a route+direction
+   * but ride different physical shapes). Realtime trip_ids don't match static
+   * ones for NYC, so we score every shape variant for this route+direction by
+   * how many of the train's own known stops (next stop + upcoming list) it
+   * contains — express/local stop patterns differ enough that this cleanly
+   * discriminates. Falls back to the single default shape when there's too
+   * little stop data to score confidently (§6.6, prevents wrong-track guesses).
+   */
   private resolveShapeId(v: RawVehicle): string | null {
     const t = this.s.trips[v.tripId];
     if (t?.shapeId && this.s.shapes[t.shapeId]) return t.shapeId;
-    // fallback: route + direction letter from stop suffix
+
     const stopRef = v.toStopId ?? v.atStopId ?? "";
     const dir = /[NS]$/.test(stopRef) ? stopRef.slice(-1) : "N";
     const key = `${v.routeId}|${dir}`;
-    const sid = this.s.routeDirShape[key];
-    return sid && this.s.shapes[sid] ? sid : null;
+    const candidates = this.s.shapesByRouteDir[key];
+    const fallback = this.s.routeDirShape[key];
+
+    if (!candidates || candidates.length <= 1) {
+      return fallback && this.s.shapes[fallback] ? fallback : null;
+    }
+
+    const known = new Set<string>();
+    if (v.atStopId) known.add(v.atStopId);
+    if (v.toStopId) known.add(v.toStopId);
+    for (const u of v.upcoming ?? []) known.add(u.stopId);
+    if (known.size < 2) return fallback && this.s.shapes[fallback] ? fallback : null; // too little to score
+
+    let best: string | null = null;
+    let bestScore = 0;
+    for (const shapeId of candidates) {
+      if (!this.s.shapes[shapeId]) continue;
+      const set = this.stopSetFor(shapeId);
+      let score = 0;
+      for (const id of known) if (set.has(id)) score++;
+      if (score > bestScore) { bestScore = score; best = shapeId; }
+    }
+    if (best && bestScore >= 2) return best; // confident match on real track pattern
+    return fallback && this.s.shapes[fallback] ? fallback : null;
   }
 
   /** distance-along-shape of a stop, via shapeStops cache or live projection. */
