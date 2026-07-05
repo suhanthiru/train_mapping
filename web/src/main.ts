@@ -64,8 +64,12 @@ const OCC_UI: Record<string, { label: string; color: string }> = {
   NOT_ACCEPTING_PASSENGERS: { label: "Not boarding", color: "#9aa7b0" },
   NOT_BOARDABLE: { label: "Not boarding", color: "#9aa7b0" },
 };
+// PAUSED: NYC's MTA feed sends occupancy as a placeholder (EMPTY for 100% of
+// trains — no passenger-counting hardware), so showing it is misleading.
+// Flip to true once a real crowding source (e.g. station ridership) is wired.
+const OCCUPANCY_ENABLED = false;
 function occupancyHTML(status?: string, pct?: number): string {
-  if (!status) return "";
+  if (!OCCUPANCY_ENABLED || !status) return "";
   const ui = OCC_UI[status] ?? { label: status.toLowerCase().replace(/_/g, " "), color: "#9aa7b0" };
   const pctStr = pct && pct > 0 ? ` · ${Math.round(pct)}%` : "";
   return `<div class="occ"><span class="occ-dot" style="background:${ui.color}"></span>` +
@@ -227,7 +231,7 @@ function showBusInfo(b: Bus) {
     `<span class="close" onclick="document.getElementById('journey').style.display='none'">✕</span>` +
     `<div class="j-head"><span class="route-badge" style="background:#F0A830">${b.route}</span>` +
     `<div><b>${b.route} bus</b><br><span class="j-dest">${(b.speed * 2.237).toFixed(0)} mph</span></div></div>` +
-    (occupancyHTML(b.occStatus, b.occPct) || `<div class="occ"><span class="occ-dot" style="background:#9aa7b0"></span><span>occupancy unknown</span></div>`);
+    occupancyHTML(b.occStatus, b.occPct); // occupancy paused (placeholder feed data) — see occupancyHTML
 }
 
 function onClick(info: PickingInfo) {

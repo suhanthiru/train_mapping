@@ -45,6 +45,10 @@ CLAUDE.md
 .github/copilot-instructions.md
 PLAN_TEST_PATH
 
+# ---- internal docs (not needed to run the project; keep local) ----
+NIGHTLY_LOG.md
+PROJECT_SPEC.md
+
 # ---- env / secrets ----
 .env
 .env.*

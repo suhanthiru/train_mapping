@@ -181,8 +181,8 @@ async function loadTrip() {
       options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: axes("seconds") },
     });
     document.getElementById("trip-table").innerHTML =
-      `<table><thead><tr><th>from→to</th><th>travel</th><th>weather</th><th>occ</th><th>hr</th></tr></thead><tbody>` +
-      segs.map((s) => `<tr><td>${s.from_stop}→${s.to_stop}</td><td>${s.travel_sec}s</td><td>${s.weather_score ?? "–"}</td><td>${s.occ_status ?? "–"}</td><td>${s.hour}</td></tr>`).join("") +
+      `<table><thead><tr><th>from→to</th><th>travel</th><th>weather</th><th>hr</th></tr></thead><tbody>` +
+      segs.map((s) => `<tr><td>${s.from_stop}→${s.to_stop}</td><td>${s.travel_sec}s</td><td>${s.weather_score ?? "–"}</td><td>${s.hour}</td></tr>`).join("") +
       `</tbody></table>`;
   } else {
     document.getElementById("trip-table").innerHTML = '<div class="empty">no segments recorded for that trip id yet</div>';
