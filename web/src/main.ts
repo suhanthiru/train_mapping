@@ -14,16 +14,20 @@ import { trainCarMesh, busMesh } from "./mesh.ts";
 const HOST = location.hostname || "localhost";
 const HTTP = `http://${HOST}:8080`;
 const WS = `ws://${HOST}:8080`;
+const ANALYTICS = `http://${HOST}:8090`; // Go streaming-analytics service (separate microservice)
 const SPEED_BOOST = 1.0; // real rate — no overshoot, so no snap-back/reversing
 
 interface RouteInfo { id: string; color: string; textColor: string; shortName: string }
 interface Stop { id: string; name: string; pos: [number, number]; parent?: string }
+type Elevation = "underground" | "surface" | "elevated";
 interface Vehicle {
   id: string; shapeId: string;
   dist: number; correct: number; speed: number; // correct = pending drift to absorb
   color: [number, number, number];
   route: string; nextStopName?: string;
   position: [number, number, number]; angle: number;
+  occStatus?: string; occPct?: number;
+  elevation: Elevation;
 }
 
 const hex2rgb = (h: string): [number, number, number] => {
@@ -31,10 +35,45 @@ const hex2rgb = (h: string): [number, number, number] => {
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 };
 
+// Synthetic depth (meters) per elevation category — OSM `layer` is ordinal,
+// not a real height, so these are tuned to be visible at the default camera
+// pitch without pushing trains through the basemap/buildings. Only applied
+// when depthMode is on (E toggle) — see keydown handler below.
+const ELEVATION_Z: Record<Elevation, number> = {
+  underground: -18,
+  surface: 0,
+  elevated: 14,
+};
+
 let shapes: Record<string, Shape> = {};
 let routes: Record<string, RouteInfo> = {};
 const vehicles = new Map<string, Vehicle>();
-interface Bus { id: string; lon: number; lat: number; tLon: number; tLat: number; heading: number; speed: number; route: string; color: [number, number, number]; }
+interface Bus { id: string; lon: number; lat: number; tLon: number; tLat: number; heading: number; speed: number; route: string; color: [number, number, number]; occStatus?: string; occPct?: number; }
+
+// Friendly label + color for a GTFS-rt occupancy status. Green (empty) ->
+// amber (seats) -> red (crowded). occPct is usually 0/placeholder in these
+// feeds, so lead with the status; only show % when it's non-trivial.
+const OCC_UI: Record<string, { label: string; color: string }> = {
+  EMPTY: { label: "Empty", color: "#4fd67a" },
+  MANY_SEATS_AVAILABLE: { label: "Many seats", color: "#7ed957" },
+  FEW_SEATS_AVAILABLE: { label: "Few seats", color: "#f0c040" },
+  STANDING_ROOM_ONLY: { label: "Standing room only", color: "#f0902f" },
+  CRUSHED_STANDING_ROOM_ONLY: { label: "Crushed — standing only", color: "#f0562f" },
+  FULL: { label: "Full", color: "#e53950" },
+  NOT_ACCEPTING_PASSENGERS: { label: "Not boarding", color: "#9aa7b0" },
+  NOT_BOARDABLE: { label: "Not boarding", color: "#9aa7b0" },
+};
+function occupancyHTML(status?: string, pct?: number): string {
+  if (!status) return "";
+  const ui = OCC_UI[status] ?? { label: status.toLowerCase().replace(/_/g, " "), color: "#9aa7b0" };
+  const pctStr = pct && pct > 0 ? ` · ${Math.round(pct)}%` : "";
+  return `<div class="occ"><span class="occ-dot" style="background:${ui.color}"></span>` +
+    `<span>${ui.label}${pctStr}</span></div>`;
+}
+interface AnomalySummary {
+  routeId: string; direction: string; mode: string; color: string;
+  gapSeconds: number; zscore: number; kind: "bunching" | "gap"; why: string;
+}
 const buses = new Map<string, Bus>();
 const CAR_MESH = trainCarMesh();
 const BUS_MESH = busMesh();
@@ -49,6 +88,7 @@ let bloomOn = true;
 let showTrains = true;
 let showBuses = true;
 let pausePush = false;
+let depthMode = false; // E: real elevation-driven z vs flat (z=0, today's look)
 let statBase = "connecting…";
 let fpsCount = 0, fpsLast = performance.now(), fpsVal = 0;
 window.addEventListener("keydown", (e) => {
@@ -62,6 +102,7 @@ window.addEventListener("keydown", (e) => {
   } else if (k === "t") showTrains = !showTrains;
   else if (k === "v") showBuses = !showBuses;
   else if (k === "p") pausePush = !pausePush;
+  else if (k === "e") depthMode = !depthMode;
 });
 
 const routeOfShape = (id: string) => id.split("..")[0];
@@ -167,6 +208,7 @@ async function showJourney(v: Vehicle) {
       `<span class="close" onclick="document.getElementById('journey').style.display='none'">✕</span>` +
       `<div class="j-head"><span class="route-badge" style="background:${data.color}">${data.route}</span>` +
       `<div><b>${data.route} train</b>${data.dest ? `<br><span class="j-dest">toward ${data.dest}</span>` : ""}</div></div>` +
+      occupancyHTML(v.occStatus, v.occPct) +
       `<div class="j-stops">${rows || '<span style="opacity:.6">no upcoming stops in feed</span>'}</div>`;
   } catch {
     journeyEl.innerHTML = `<span class="close" onclick="document.getElementById('journey').style.display='none'">✕</span>` +
@@ -174,10 +216,23 @@ async function showJourney(v: Vehicle) {
   }
 }
 
+function showBusInfo(b: Bus) {
+  arrivalsEl.style.display = "none";
+  journeyEl.style.display = "block";
+  journeyEl.style.setProperty("--line", "#F0A830");
+  journeyEl.innerHTML =
+    `<span class="close" onclick="document.getElementById('journey').style.display='none'">✕</span>` +
+    `<div class="j-head"><span class="route-badge" style="background:#F0A830">${b.route}</span>` +
+    `<div><b>${b.route} bus</b><br><span class="j-dest">${(b.speed * 2.237).toFixed(0)} mph</span></div></div>` +
+    (occupancyHTML(b.occStatus, b.occPct) || `<div class="occ"><span class="occ-dot" style="background:#9aa7b0"></span><span>occupancy unknown</span></div>`);
+}
+
 function onClick(info: PickingInfo) {
   const id = info.layer?.id;
   if (info.object && (id === "trains" || id === "train-glow")) {
     showJourney((id === "trains" ? (info.object as Car).v : info.object) as Vehicle);
+  } else if (info.object && (id === "buses" || id === "bus-glow")) {
+    showBusInfo(info.object as Bus);
   } else if (info.object && id === "stations") {
     showArrivals(info.object as Stop);
   } else {
@@ -213,7 +268,7 @@ function buildStatic() {
 
 // dynamic train layers — each train drawn as CARS_PER_TRAIN cars placed along
 // the track shape, so it articulates around curves. Rebuilt each frame.
-interface Car { position: [number, number]; angle: number; color: [number, number, number]; v: Vehicle; }
+interface Car { position: [number, number, number]; angle: number; color: [number, number, number]; v: Vehicle; }
 function trainLayers() {
   if (!showTrains) return [];
   const heads = [...vehicles.values()];
@@ -221,11 +276,12 @@ function trainLayers() {
   for (const v of heads) {
     const shape = shapes[v.shapeId];
     if (!shape) continue;
+    const z = depthMode ? ELEVATION_Z[v.elevation] ?? 0 : 0;
     for (let i = 0; i < CARS_PER_TRAIN; i++) {
       const d = v.dist - i * CAR_SPACING;
       if (d < 0) break;
       const p = distToLonLat(shape, d);
-      cars.push({ position: [p[0], p[1]], angle: bearingAt(shape, d), color: v.color, v });
+      cars.push({ position: [p[0], p[1], z], angle: bearingAt(shape, d), color: v.color, v });
     }
   }
   return [
@@ -273,6 +329,34 @@ function busLayers() {
   ];
 }
 
+// --- anomalies panel: fetched from the Go analytics microservice (:8090) ---
+const anomaliesEl = document.getElementById("anomalies")!;
+async function pollAnomalies() {
+  try {
+    const anomalies: AnomalySummary[] = await fetch(`${ANALYTICS}/anomalies`).then((r) => r.json());
+    if (!Array.isArray(anomalies)) return;
+    if (anomalies.length === 0) {
+      anomaliesEl.style.display = "none";
+      return;
+    }
+    anomaliesEl.style.display = "block";
+    const items = anomalies
+      .slice(0, 12)
+      .map((a) => {
+        const label = a.mode === "bus" ? `${a.routeId} bus` : `${a.routeId} train ${a.direction}`.trim();
+        return `<div class="a-item ${a.kind}">` +
+          `<div class="a-row"><span class="route-badge" style="background:${a.color}">${a.routeId}</span>` +
+          `<b style="font-size:12.5px">${label}</b></div>` +
+          `<div class="a-kind">${a.kind}</div>` +
+          `<div class="a-why">${a.why}</div></div>`;
+      })
+      .join("");
+    anomaliesEl.innerHTML = `<div class="a-head">Live anomalies (${anomalies.length})</div>${items}`;
+  } catch { /* Go service may not be running yet — fail quietly */ }
+}
+setInterval(pollAnomalies, 5000);
+pollAnomalies();
+
 function updateLayers() { overlay.setProps({ layers: [...staticLayers, ...trainLayers(), ...busLayers()] }); }
 
 // --- animation: dead-reckon anchor forward (boosted) + ease render toward it ---
@@ -296,7 +380,7 @@ function frame(now: number) {
         v.correct -= catchup;
         if (v.dist > total) v.dist = total;
         const [lon, lat] = distToLonLat(shape, v.dist);
-        v.position = [lon, lat, 0];
+        v.position = [lon, lat, depthMode ? ELEVATION_Z[v.elevation] ?? 0 : 0];
         v.angle = bearingAt(shape, v.dist);
       } catch { /* skip one bad vehicle */ }
     }
@@ -316,7 +400,7 @@ function frame(now: number) {
     if (now - fpsLast > 500) {
       fpsVal = Math.round((fpsCount * 1000) / (now - fpsLast));
       fpsCount = 0; fpsLast = now;
-      statEl.textContent = `${statBase} · ${fpsVal} fps · [B]ldg [G]low [T]rain [V]bus [P]ause`;
+      statEl.textContent = `${statBase} · ${fpsVal} fps · [B]ldg [G]low [T]rain [V]bus [P]ause [E]levation`;
     }
   } catch (e) {
     console.error("[frame] error (loop continues):", e);
@@ -392,10 +476,11 @@ function applyState(list: any[]) {
         // along heading — that cuts across curves and drifts off the street
         eb.tLon = s.pos[0]; eb.tLat = s.pos[1];
         eb.speed = s.speed ?? eb.speed;
+        eb.occStatus = s.occStatus; eb.occPct = s.occPct;
         if (Math.abs(eb.tLon - eb.lon) > 0.02 || Math.abs(eb.tLat - eb.lat) > 0.02) { eb.lon = eb.tLon; eb.lat = eb.tLat; } // snap big jumps
       } else {
         // initial heading: convert feed bearing via the user-calibrated mode (compass = 90 - b)
-        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], tLon: s.pos[0], tLat: s.pos[1], heading: ((90 - (s.bearing ?? 0)) + 360) % 360, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color) });
+        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], tLon: s.pos[0], tLat: s.pos[1], heading: ((90 - (s.bearing ?? 0)) + 360) % 360, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color), occStatus: s.occStatus, occPct: s.occPct });
       }
       continue;
     }
@@ -404,6 +489,8 @@ function applyState(list: any[]) {
     const ex = vehicles.get(s.id);
     if (ex) {
       ex.route = s.route; ex.nextStopName = s.nextStopName;
+      ex.occStatus = s.occStatus; ex.occPct = s.occPct;
+      ex.elevation = s.elevation ?? "underground"; // can change if shape resolution reroutes (express/local)
       const drift = s.dist - ex.dist;
       if (Math.abs(drift) > 1500) { ex.dist = s.dist; ex.correct = 0; }
       else ex.correct = drift; // signed; absorbed as gentle speed-up/slow-down in frame()
@@ -414,6 +501,8 @@ function applyState(list: any[]) {
         color: hex2rgb(s.color), route: s.route, nextStopName: s.nextStopName,
         position: [...distToLonLat(shapes[s.shapeId], s.dist), 0] as [number, number, number],
         angle: bearingAt(shapes[s.shapeId], s.dist),
+        occStatus: s.occStatus, occPct: s.occPct,
+        elevation: s.elevation ?? "underground",
       });
     }
   }

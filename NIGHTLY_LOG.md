@@ -102,3 +102,111 @@ the user: (a) eyes on pixels (my screenshot tool offline all session), (b) MARTA
 
 ## Blockers encountered
 _(none — all Phase 1 data dependencies verified; backend fully working against live data.)_
+
+## Phase 2: Polyglot analytics layer (portfolio extension)
+
+User wanted a portfolio piece demonstrating streaming-analytics/data-fusion skills (the
+kind of engineering companies like Palantir/Flock do), scoped strictly to public
+vehicles + public aggregate data (no individual tracking — see PROJECT_SPEC.md §12 Scope
+Boundary), and explicitly wanted it to span multiple languages for skill demonstration:
+**Go** for the streaming anomaly-detection service, **Python** for weather/311 data
+fusion, alongside the existing TypeScript stack (left untouched).
+
+All 10 planned build steps completed and live-data verified this session:
+
+- [x] **analytics-go/ scaffolded**, portable Go 1.23.4 installed (no admin, same pattern as
+      portable Node). Connects to the existing Node WS server as a plain client — verified:
+      537 vehicles decoded correctly (387 trains + 150 buses) from the live snapshot+state
+      broadcasts. `server/index.ts` needed **zero changes**.
+- [x] **Density grid bucketing** — verified live: Midtown box consistently ~22-23 vehicles
+      vs. 11 in an outer-borough box (~2x), matching real-world expectations.
+- [x] **GET /density + frontend heatmap** (key `H`) — verified via browser fetch, 200 OK,
+      0 console errors.
+- [x] **Welford baseline + subway headway** — event-driven passage detection at an
+      auto-selected reference stop per route+direction. Verified: caught REAL live passage
+      events (`7|N: gap=192s`, `1|S: gap=184s`) — both plausible real subway headways.
+      Debugging note: initially got zero samples for ~90s because I forgot to kill a stray
+      prior process holding :8090, which made `log.Fatalf` silently kill the whole program
+      before it ever processed a WS message — not a logic bug, a process-hygiene mistake.
+- [x] **Bus proximity headway** — pairwise haversine distance -> time gap. Verified: M104
+      route showed two buses 19m apart / 4s gap, a genuinely bunched pair.
+- [x] **Anomaly thresholding** — z-score (>2.5, n>=20) + absolute floor rule for cold start.
+      **Live calibration finding**: initial 180s bus-bunching floor flagged nearly every
+      active route (straight-line distance underestimates real road-distance in a grid
+      city) — tightened to 45s based on observed live gap distributions, dropping flagged
+      routes from ~all to a selective ~6/40.
+- [x] **GET /anomalies + #anomalies panel** — verified real rendered DOM content in a
+      headless browser: "LIVE ANOMALIES (3)" with correct badges/kind/why-text.
+      Caught and fixed two real bugs here: a grammar bug ("buss" instead of "buses") and a
+      text-encoding mojibake bug (em-dash literal got corrupted somewhere in the write
+      pipeline) — fixed by switching to a plain ASCII separator instead of fighting the
+      encoding.
+- [x] **analytics-py/ scaffolded** (stdlib only, no pip installs) — weather.py verified
+      against live NWS (`api.weather.gov`): real data returned (75°F, "Heavy Rain",
+      precipitating=true). nyc311.py verified against live Socrata data.
+      **Real finding, not assumed**: NYC 311's current taxonomy has NO "Subway Delay" or
+      general transit-service category — subway/bus service complaints go directly to the
+      MTA (a state authority), not city 311. Closest real categories are
+      `Bus Stop Shelter Complaint`/`Bus Stop Shelter Placement` (about the physical
+      shelter, not service) — used honestly labeled as such. Also widened the lookback
+      window from an assumed 24h to 72h after finding real volume is only ~4/day citywide
+      for these categories (24h was usually zero).
+- [x] **Go -> Python /context wiring** — enrichment runs on its own ~15s timer (separate
+      goroutine), never blocking the hot per-tick WS path; store only gets overwritten by
+      the enriched version, avoiding a race with the fast path. Verified end-to-end in a
+      real browser DOM: `"Two buses only 2s apart - closer than expected (baseline still
+      building, n=12). (active heavy rain in the area)"` — genuine data flowing through
+      all three processes (Node -> Go -> Python -> Go -> frontend).
+- [x] **Docs**: PROJECT_SPEC.md §12 (scope boundary + full architecture + calibration
+      findings), this log entry. HUD hint string already included `[H]eat` from step 3.
+
+**Process note**: no commits made this phase — user asked to review and commit everything
+themselves at the end (see memory: feedback_no_auto_commit.md).
+
+**Known follow-ups, not blocking**: no historical baseline seeding from `history.db` (v1
+baselines start cold, build up live); no combined start script for the 3 services (not
+asked for); subway-side 311 fusion has no real proxy available in the current NYC Open
+Data taxonomy (documented limitation, not a bug).
+
+## Phase 2b: persistence + occupancy + heatmap removal
+
+User asked to: create the DB (the earlier phase had NONE — I'd wrongly documented one;
+verified by inspecting go.mod/code and corrected the docs), store occupancy time series +
+what's needed for constant anomaly detection, remove the "weird" density heatmap, and add
+occupancy to the click-a-vehicle UI. All done and live-verified:
+
+- [x] **Honest correction first**: confirmed the prior phase's analytics-go had zero
+      persistence (go.mod only had gorilla/websocket, no .db file existed) — the
+      PROJECT_SPEC claim of "writes analytics.db" was aspirational, never built. Fixed the
+      docs, then actually built it.
+- [x] **Occupancy through the TS pipeline**: verified both feeds carry occupancy on 100% of
+      vehicles (57/57 subway, 797/797 bus). New shared/occupancy.ts decoder used by both
+      ingest adapters; threaded via VehicleState into the WS broadcast. Verified live:
+      425/461 vehicles carry occStatus (all buses + most trains), real distribution
+      (mostly EMPTY off-peak). Note: occupancyPercentage is usually a 0 placeholder, so UI
+      leads with the enum status.
+- [x] **Go SQLite persistence** (modernc.org/sqlite, pure-Go, no cgo): 3 tables —
+      occupancy (on-change writes, compact transition series), baselines (Welford n/mean/m2,
+      upsert every 30s, LOAD on startup), anomaly_events (on onset). Added Welford
+      State/Restore + detector Export/ImportBaseline + DrainNewEvents.
+      **Verified the actual point of it**: run #1 fresh -> "seeded 0 baselines"; run #2 ->
+      "seeded 39 baselines from disk" = anomaly detection is now WARM on restart, not
+      cold. All 3 tables confirmed writing real rows (occupancy grew 8->60, anomaly_events
+      6->43 over the session).
+- [x] **Removed the density heatmap** entirely: frontend (H key, densityLayers, pollDensity,
+      DensityCell, HUD hint) and Go (/density endpoint, internal/density package deleted,
+      midtown/outer diagnostic removed). Both build clean.
+- [x] **Occupancy in the click UI**: train journey panel gains an occupancy row (verified:
+      "1 train / toward South Ferry / Empty" with colored dot); buses are now clickable ->
+      new panel with route/speed/occupancy (verified: "B12 bus / 11 mph / Few seats").
+      Green->amber->red status color scale in shared OCC_UI map.
+- [x] Docs corrected throughout (PROJECT_SPEC §12: real DB, no heatmap, occupancy features;
+      API surface; running instructions). This log entry.
+
+Final state: all 3 services healthy together (Node 448 vehicles, Go 6 anomalies, Python ok),
+analytics.db actively accumulating. No git commits (user commits themselves).
+
+**New known follow-up**: the occupancy table currently keys on `vehicleId` which for subway
+is the trip id (changes when a train finishes its trip) — fine for spatio-temporal
+crowding analytics, but not a stable per-physical-train identity across trips (GTFS-rt
+doesn't expose that for NYC anyway).

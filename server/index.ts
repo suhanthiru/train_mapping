@@ -12,11 +12,14 @@ import { fetchNycVehicles } from "../ingest/nyc.ts";
 import { fetchNycBuses } from "../ingest/nyc-bus.ts";
 import { Interpolator, loadStatic } from "../core/interpolate.ts";
 import { History } from "../history/db.ts";
+import { PredictionLedger } from "../history/ledger.ts";
 import type { VehicleState, RawVehicle } from "../shared/types.ts";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const POLL_MS = 30_000; // how often we hit the live feed
 const PUSH_MS = 4_000; // how often we re-interpolate + broadcast fresh positions
+const WEATHER_MS = 5 * 60_000; // how often we sample the weather severity scalar
+const ANALYTICS_PY = process.env.ANALYTICS_PY ?? "http://localhost:8091";
 const ROOT = process.cwd();
 const DATA_DIR = join(ROOT, "data");
 const WEB_DIST = join(ROOT, "web", "dist");
@@ -33,6 +36,7 @@ const MIME: Record<string, string> = {
 const stat = loadStatic(join(DATA_DIR, "nyc"));
 const interp = new Interpolator(stat);
 const history = new History(join(DATA_DIR, "history.db"));
+const ledger = new PredictionLedger(join(DATA_DIR, "ledger.db"));
 
 let latest: VehicleState[] = [];
 let lastRaws: RawVehicle[] = [];
@@ -50,8 +54,37 @@ async function fetchTick() {
     lastRaws = raws;
     lastBuses = buses;
     console.log(`[server] feed: ${lastRaws.length} trains + ${lastBuses.length} buses -> ${wss.clients.size} clients`);
+    // Prediction ledger (bitemporal): log the feed's evolving ETAs + ground
+    // truth on the 30s poll grain. Isolated in try/catch so a ledger hiccup
+    // never disrupts the live feed / broadcast path.
+    try {
+      ledger.recordPredictions(lastRaws);
+      ledger.recordActuals(lastRaws);
+    } catch (e) {
+      console.error("[server] ledger error:", (e as Error).message);
+    }
   } catch (e) {
     console.error("[server] feed error:", (e as Error).message);
+  }
+}
+
+// Slow weather sampler: pull the 0-100 severity scalar from the Python service
+// into the ledger as an ETA-model feature. Degrades to a gap (never a crash) if
+// the Python service is down.
+async function weatherTick() {
+  try {
+    const r = await fetch(`${ANALYTICS_PY}/weather-score`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const w = (await r.json()) as { severity?: number; tempF?: number; precipitating?: boolean; conditions?: string };
+    ledger.recordConditions(
+      Math.floor(Date.now() / 1000),
+      w.severity ?? null,
+      w.tempF ?? null,
+      Boolean(w.precipitating),
+      w.conditions ?? null
+    );
+  } catch (e) {
+    console.error("[server] weather sample skipped:", (e as Error).message);
   }
 }
 
@@ -92,6 +125,16 @@ const server = createServer(async (req, res) => {
         dest: stops.length ? stops[stops.length - 1].name : undefined,
         stops,
       })
+    );
+    return;
+  }
+
+  // Backtest read-out: feed-prediction accuracy (MAE + bias) vs. lead time.
+  if (url === "/api/prediction-accuracy") {
+    const source = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("source") ?? "gtfs-rt";
+    const buckets = ledger.accuracyByLeadTime(source);
+    res.writeHead(200, { "Content-Type": "application/json" }).end(
+      JSON.stringify({ source, counts: ledger.counts(), buckets })
     );
     return;
   }
@@ -166,8 +209,19 @@ server.listen(PORT, () => {
   fetchTick().then(pushTick); // fetch immediately, then push so first client gets data fast
   setInterval(fetchTick, POLL_MS);
   setInterval(pushTick, PUSH_MS);
+  weatherTick(); // sample once at boot, then on a slow timer
+  setInterval(weatherTick, WEATHER_MS);
   setInterval(() => {
     const removed = history.prune();
     if (removed) console.log(`[server] pruned ${removed} old history rows`);
+    const ledgerRemoved = ledger.prune();
+    if (ledgerRemoved) console.log(`[server] pruned ${ledgerRemoved} old ledger rows`);
+    // rebuild the segment-traversal table (graph edges + ML training rows)
+    try {
+      const segs = ledger.buildSegments();
+      console.log(`[server] rebuilt ${segs} segment traversals`);
+    } catch (e) {
+      console.error("[server] buildSegments failed:", (e as Error).message);
+    }
   }, 3600_000);
 });

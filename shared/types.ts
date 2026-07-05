@@ -22,6 +22,8 @@ export interface VehicleState {
   nextStopName?: string;
   delay?: number; // seconds, +late / -early
   stale?: boolean;
+  occStatus?: string; // GTFS-rt OccupancyStatus enum name, e.g. "STANDING_ROOM_ONLY"
+  occPct?: number; // GTFS-rt occupancyPercentage (0-100), when present
 }
 
 /** A track polyline with precomputed cumulative distance at each vertex. */
@@ -68,6 +70,8 @@ export interface RawVehicle {
   atStopId?: string;
   feedTimestamp: number; // epoch seconds
   upcoming?: { stopId: string; time: number }[]; // future stops (for arrivals boards)
+  occStatus?: string; // GTFS-rt OccupancyStatus enum name
+  occPct?: number; // GTFS-rt occupancyPercentage (0-100)
 }
 
 /** A row persisted to the rolling-7-day SQLite history (§5). */

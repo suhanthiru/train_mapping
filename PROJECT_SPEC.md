@@ -273,3 +273,161 @@ train-tracker/
 - Bus data volume is a real scaling exercise — deliberately deferred to Phase 5
 - Static/realtime trip-ID matching occasionally fails — mitigated by straight-line fallback
 - "Always Free" Oracle tier is a policy, not a contract — keep infra scripted/reproducible
+
+---
+
+## 12. Analytics layer — polyglot streaming anomaly detection + data fusion
+
+A portfolio-oriented extension (added as a second phase after the core 3D tracker was
+working) demonstrating streaming-analytics and data-fusion engineering across three
+languages, each doing the part it's naturally suited for.
+
+### Scope boundary (non-negotiable)
+
+This layer reasons **only** about:
+- Public transit vehicles already tracked by this project (subway trains, buses) —
+  aggregate route/segment-level statistics (headway gaps, density per grid cell), never
+  an individual vehicle's identity-linked history beyond what already exists.
+- Public aggregate open-data sources: NWS weather observations (describes weather, not
+  people) and NYC 311 complaint **category counts** (public dataset; `$select` allowlists
+  only `complaint_type`, `descriptor`, `created_date`, lat/lon, `borough` — no
+  complainant-identifying column is ever requested).
+
+Explicitly out of scope, permanently: license plate recognition, vehicle-owner/operator
+identification, fusion with any dataset that identifies a specific person, enforcement/
+dispatch-override/ticketing features. Output is always descriptive ("this route shows
+anomalous bunching"), never prescriptive-to-a-person. Correlation language only in all
+"why" annotations ("nearby", "recent") — never a causal claim.
+
+### Architecture — three services, three languages
+
+```
+Node/TS (existing, UNCHANGED)     Go (analytics-go/, :8090)      Python (analytics-py/, :8091)
+──────────────────────────        ─────────────────────────       ────────────────────────────
+GTFS decode, interpolation,        WS client -> :8080 (reads       stdlib http.server
+3D rendering, WS server :8080      the SAME broadcast the          weather.py: api.weather.gov
+  (now also decodes GTFS-rt         frontend already consumes —     nyc311.py: NYC Open Data
+   occupancy into VehicleState)     server/index.ts needs ZERO      Socrata (see finding below)
+                                    changes)                        server.py: GET /context
+                                    Welford stats per route+dir,
+                                    headway/bunching detection.
+                                    SQLite (data/analytics.db,
+                                    pure-Go modernc.org/sqlite):
+                                      occupancy time series,
+                                      baselines (persist+seed),
+                                      anomaly_events
+                                    serves :8090
+                                      GET /anomalies (calls
+                                      Python's /context on a
+                                      separate ~15s enrichment
+                                      timer, never in the hot
+                                      per-tick WS path)
+```
+
+**Why each language:** TypeScript is untouched-in-spirit (proven, working — GTFS protocol
+decode and 3D rendering are exactly what it already does well; only additive change was
+decoding the occupancy field the feeds already carry). Go handles the compute-heavy
+concurrent stream processing (Welford's online mean/variance per route+direction,
+headway/bunching detection) and persistence. Python handles REST-API glue + human-readable
+correlation text generation (weather, 311).
+
+### Headway/bunching detection
+
+- **Subway**: event-driven. Each route+direction gets one auto-selected reference stop
+  (nearest the shape's midpoint, from `shapeStops.json`). Watches each train's remaining
+  distance to that stop (already-continuous `dist` from the interpolator); a passage event
+  fires when remaining distance crosses from positive to ≤0. The gap between consecutive
+  passages at the same reference stop is a real headway sample.
+  Simplification: uses each route+direction's *default* shape only (from
+  `routeDirShape.json`) — an express/local variant that skips the chosen reference stop
+  won't register a passage there. Acceptable for v1.
+- **Bus**: no shape/route geometry exists for buses by design (`ingest/nyc-bus.ts` is
+  GPS-only). Instead: every tick, the minimum pairwise haversine distance between
+  same-route buses, converted to a time gap via the pair's average reported speed.
+- **Baseline**: Welford's online mean/variance per key (O(1) memory, no raw-sample
+  storage). No historical seeding from `history.db` was implemented in v1 (an
+  acknowledged deferred enhancement — baselines start cold and build up live).
+- **Anomaly flag**: z-score > 2.5 once a key has ≥20 samples, OR an absolute floor rule for
+  cold start.
+
+**Live-data calibration findings** (from actually running this against the feed, not
+assumed):
+- The bus floor rule started at 180s and flagged nearly every active route — straight-line
+  (haversine) distance systematically *underestimates* true road-following distance in a
+  dense street grid, so "close as the crow flies" doesn't mean "actually bunched." Tightened
+  to 45s based on the observed gap distribution across ~30 live routes.
+- NYC 311's current taxonomy has **no "Subway Delay" or general transit-service category**.
+  Subway/bus service complaints go directly to the MTA (a state authority), not city 311.
+  The closest genuinely transit-adjacent categories are `Bus Stop Shelter Complaint` /
+  `Bus Stop Shelter Placement` — about the physical shelter structure, not service — used
+  honestly labeled as such rather than mislabeled as delay complaints. There is no subway
+  311 proxy at all; this is a real, permanent gap in the fusion, not a bug.
+- The default 24h 311 lookback window was widened to 72h — live volume checks showed only
+  ~4 complaints/day citywide for the relevant categories, so 24h was usually zero.
+
+### Data model / storage
+
+`analytics-go` maintains its own SQLite database (`data/analytics.db`) via the pure-Go
+`modernc.org/sqlite` driver (no cgo / no native build toolchain — same rationale as
+`node:sqlite` over `better-sqlite3` on the TS side). Kept separate from the Node server's
+`history.db` to avoid two-process concurrent-writer contention. Three tables:
+
+- **`occupancy`** — a time series of vehicle crowding for future analytics, written
+  **on-change only** (a row is inserted just when a vehicle's occupancy status transitions,
+  not every 4s tick — a compact state-transition series, not a firehose). Columns:
+  `ts, vehicleId, route, mode, status, pct, lon, lat`. Rolling 30-day retention.
+- **`baselines`** — the persisted Welford state (`n, mean, m2`) per route+direction key,
+  upserted every 30s. **Loaded on startup so anomaly detection is warm on restart instead
+  of cold-starting at n=0** (this is the "constant anomaly detection" requirement — verified
+  live: a fresh run seeds 0, a subsequent run seeds ~40 baselines from disk). Never pruned
+  (one row per key).
+- **`anomaly_events`** — one row per anomaly *onset* (logged when a key transitions into a
+  flagged state, not every tick it stays flagged), for future analytics. Rolling 30-day
+  retention.
+
+(Historical note: an earlier draft of this doc incorrectly stated Go had no database — that
+was written before this table existed. The DB is real and verified.)
+
+### Occupancy / crowding
+
+Both the NYC subway and OBA bus GTFS-realtime feeds carry `occupancyStatus` (and a usually-
+placeholder `occupancyPercentage`) on **100% of vehicles** (verified live: 57/57 subway,
+797/797 bus). This is decoded in `shared/occupancy.ts` (used by both ingest adapters),
+threaded through `VehicleState` into the WebSocket broadcast, and:
+- **Displayed** in the click-a-vehicle panels — the train journey panel gains an occupancy
+  row above the stop timeline; clicking a bus now opens a small panel with route, speed, and
+  occupancy. Friendly label + green→amber→red color scale (`EMPTY` → `FULL`); the percentage
+  is shown only when non-zero (the feed usually sends 0 as a placeholder, so the enum status
+  is the reliable signal and is what's led with).
+- **Persisted** by Go into the `occupancy` table (on-change) for future spatio-temporal
+  crowding analytics.
+
+(The earlier density heatmap was removed at the user's request — vehicle-count density was
+"weird"; occupancy is the more meaningful crowding signal and is surfaced per-vehicle
+instead.)
+
+### API surface
+
+- Go (`:8090`): `GET /anomalies`, `GET /health`
+- Python (`:8091`): `GET /context?routeId=&lat=&lon=`, `GET /health`
+- Frontend fetches `:8090/anomalies` directly (not proxied through the Node server) — polled
+  every 5s. Occupancy comes through the existing `:8080` WebSocket, not a new endpoint.
+
+### Running the three services
+
+Each runs in its own terminal (no combined start script built — not asked for):
+```bash
+# 1. Node backend (as before)
+npm run server
+
+# 2. Go analytics service
+cd analytics-go
+../.tools/go/bin/go.exe run .   # or: go build -o analytics.exe . && ./analytics.exe
+
+# 3. Python analytics service (stdlib only, no pip install needed)
+cd analytics-py
+python server.py
+```
+Frontend: the `#anomalies` panel (top-right) appears automatically whenever the Go service
+reports ≥1 flagged anomaly; click any train or bus to see its occupancy (plus the train's
+upcoming-stop timeline). The density heatmap toggle was removed.

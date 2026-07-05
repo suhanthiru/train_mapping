@@ -20,6 +20,7 @@ import type {
   Stop,
   RouteInfo,
   TripInfo,
+  Elevation,
 } from "../shared/types.ts";
 import { projectDist, distToLonLat } from "../shared/geo.ts";
 
@@ -34,10 +35,18 @@ interface StaticData {
   routeDirShape: Record<string, string>;
   shapeStops: Record<string, { id: string; dist: number }[]>;
   shapesByRouteDir: Record<string, string[]>;
+  shapeElevation: Record<string, Elevation>;
 }
 
 export function loadStatic(dir: string): StaticData {
   const rd = (f: string) => JSON.parse(readFileSync(join(dir, f), "utf8"));
+  let shapeElevation: Record<string, Elevation> = {};
+  try {
+    shapeElevation = rd("shapeElevation.json");
+  } catch {
+    // optional — offline OSM matching (preprocess/match-osm-elevation.ts)
+    // hasn't been run yet; every shape falls back to "underground" below.
+  }
   return {
     shapes: rd("shapes.json"),
     stops: rd("stops.json"),
@@ -46,6 +55,7 @@ export function loadStatic(dir: string): StaticData {
     routeDirShape: rd("routeDirShape.json"),
     shapeStops: rd("shapeStops.json"),
     shapesByRouteDir: rd("shapesByRouteDir.json"),
+    shapeElevation,
   };
 }
 
@@ -232,10 +242,12 @@ export class Interpolator {
         shapeId,
         dist,
         speed,
-        elevation: "underground", // per-segment refinement is a later task
+        elevation: this.s.shapeElevation[shapeId] ?? "underground",
         nextStop: nextStopId,
         nextStopName: nextStopId ? this.s.stops[nextStopId]?.name : undefined,
         stale,
+        occStatus: v.occStatus,
+        occPct: v.occPct,
       });
     }
     return out;
