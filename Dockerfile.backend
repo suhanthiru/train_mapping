@@ -1,0 +1,17 @@
+# Node/TypeScript backend: GTFS ingest + interpolation + WebSocket + ledger,
+# serves the built frontend. data/ and web/dist are volume-mounted (see compose).
+FROM node:24-slim
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY server ./server
+COPY core ./core
+COPY ingest ./ingest
+COPY shared ./shared
+COPY history ./history
+COPY preprocess ./preprocess
+COPY tsconfig.json ./
+ENV KALMAN_RS=http://kalman-rs:8092
+ENV ANALYTICS_PY=http://analytics-py:8091
+EXPOSE 8080
+CMD ["npm", "run", "server"]

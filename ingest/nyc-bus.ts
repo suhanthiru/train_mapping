@@ -7,6 +7,7 @@ import GtfsRealtimeBindings from "gtfs-realtime-bindings";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { VehicleState } from "../shared/types.ts";
+import { decodeOccupancy } from "../shared/occupancy.ts";
 
 const FEED = "https://gtfsrt.prod.obanyc.com/vehiclePositions";
 const BUS_COLOR = "#F0A830"; // warm amber — reads distinctly from the cyan trains
@@ -34,6 +35,7 @@ export async function fetchNycBuses(): Promise<VehicleState[]> {
       const p = ve?.position;
       if (!p || p.latitude == null || p.longitude == null) continue;
       const route = ve!.trip?.routeId || ve!.vehicle?.label || "BUS";
+      const occ = decodeOccupancy(ve!);
       out.push({
         id: `nyc-bus:${e.id}`,
         city: "nyc",
@@ -47,6 +49,8 @@ export async function fetchNycBuses(): Promise<VehicleState[]> {
         pos: [p.longitude, p.latitude],
         elevation: "surface",
         stale: Math.floor(Date.now() / 1000) - ts > 180,
+        occStatus: occ.occStatus,
+        occPct: occ.occPct,
       });
     }
   } catch (e) {

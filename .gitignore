@@ -1,34 +1,62 @@
-# dependencies
+# ---- dependencies ----
 node_modules/
 web/node_modules/
 .tools/
 
-# build output / compiled binaries
+# ---- build output ----
 dist/
 web/dist/
-*.exe
-*.exe~
+target/
+kalman-rs/target/
+**/*.exe
+**/*.exe~
+*.pdb
 
-# data & databases (large / regenerable)
+# ---- data & databases (large / regenerable) ----
 data/
 *.db
+*.db-journal
+*.db-wal
 *.sqlite
 *.sqlite3
 
-# python
+# ---- python ----
 __pycache__/
 *.pyc
+*.pyo
+.venv/
+venv/
 
-# assistant / AI-tool traces (keep local, never push)
+# ---- ml artifacts (regenerable via train_eta.py) ----
+*.onnx
+*.model
+*.pkl
+*.joblib
+analytics-py/eta_model.json
+analytics-py/eta_features.json
+
+# ---- assistant / tooling (keep local, out of the repo) ----
 .claude/
+**/CLAUDE.md
 CLAUDE.md
-PLAN_TEST_PATH
 .cursor/
+.cursorrules
 .aider*
+.github/copilot-instructions.md
+PLAN_TEST_PATH
 
-# env / secrets
+# ---- internal docs (not needed to run the project; keep local) ----
+NIGHTLY_LOG.md
+PROJECT_SPEC.md
+
+# ---- env / secrets ----
 .env
+.env.*
+!.env.example
 
-# os / editor
+# ---- editor / os ----
+.vscode/
+.idea/
 .DS_Store
 Thumbs.db
+*.swp

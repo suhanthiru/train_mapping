@@ -17,11 +17,15 @@ export interface VehicleState {
   speed: number; // m/s, for client-side tween
   bearing?: number;
   pos?: [number, number]; // [lon,lat] direct position (buses have GPS, no shape)
+  measuredDist?: number; // raw anchored dist BEFORE the continuity clamp (Kalman input)
+  uncertainty?: number; // √(position variance), meters — from the Kalman sidecar (Phase 2)
   elevation: Elevation;
   nextStop?: string;
   nextStopName?: string;
   delay?: number; // seconds, +late / -early
   stale?: boolean;
+  occStatus?: string; // GTFS-rt OccupancyStatus enum name, e.g. "STANDING_ROOM_ONLY"
+  occPct?: number; // GTFS-rt occupancyPercentage (0-100), when present
 }
 
 /** A track polyline with precomputed cumulative distance at each vertex. */
@@ -68,6 +72,8 @@ export interface RawVehicle {
   atStopId?: string;
   feedTimestamp: number; // epoch seconds
   upcoming?: { stopId: string; time: number }[]; // future stops (for arrivals boards)
+  occStatus?: string; // GTFS-rt OccupancyStatus enum name
+  occPct?: number; // GTFS-rt occupancyPercentage (0-100)
 }
 
 /** A row persisted to the rolling-7-day SQLite history (§5). */

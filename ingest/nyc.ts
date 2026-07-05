@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { RawVehicle, Stop } from "../shared/types.ts";
+import { decodeOccupancy } from "../shared/occupancy.ts";
 
 // The MTA splits the subway into feeds by line group. %2F = "/" (nyct/<feed>).
 const BASE = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2F";
@@ -121,6 +122,9 @@ export async function fetchNycVehicles(): Promise<RawVehicle[]> {
         v.currentStatus =
           ve.currentStatus != null ? statusMap[ve.currentStatus] : v.currentStatus;
         v.atStopId = ve.stopId ?? v.atStopId;
+        const occ = decodeOccupancy(ve);
+        v.occStatus = occ.occStatus ?? v.occStatus;
+        v.occPct = occ.occPct ?? v.occPct;
         out.set(tripId, v);
       }
     }

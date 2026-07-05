@@ -1,0 +1,12 @@
+.git
+node_modules
+web/node_modules
+web/dist
+.tools
+data
+**/target
+**/__pycache__
+*.db
+*.exe
+.claude
+kalman-rs/target
