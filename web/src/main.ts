@@ -28,6 +28,7 @@ interface Vehicle {
   position: [number, number, number]; angle: number;
   occStatus?: string; occPct?: number;
   elevation: Elevation;
+  uncertainty?: number; // √variance (m) from the Kalman sidecar; drives the K halo
 }
 
 const hex2rgb = (h: string): [number, number, number] => {
@@ -89,6 +90,7 @@ let showTrains = true;
 let showBuses = true;
 let pausePush = false;
 let depthMode = false; // E: real elevation-driven z vs flat (z=0, today's look)
+let showUncertainty = false; // K: Kalman position-uncertainty halos (default off)
 let statBase = "connecting…";
 let fpsCount = 0, fpsLast = performance.now(), fpsVal = 0;
 window.addEventListener("keydown", (e) => {
@@ -103,6 +105,7 @@ window.addEventListener("keydown", (e) => {
   else if (k === "v") showBuses = !showBuses;
   else if (k === "p") pausePush = !pausePush;
   else if (k === "e") depthMode = !depthMode;
+  else if (k === "k") showUncertainty = !showUncertainty;
 });
 
 const routeOfShape = (id: string) => id.split("..")[0];
@@ -285,6 +288,21 @@ function trainLayers() {
     }
   }
   return [
+    // Kalman position-uncertainty halo (K toggle): radius = √variance in meters,
+    // so it tightens on confident tracks and swells when the filter is unsure.
+    ...(showUncertainty
+      ? [
+          new ScatterplotLayer({
+            id: "train-uncertainty", data: heads,
+            getPosition: (d: Vehicle) => d.position,
+            getFillColor: (d: Vehicle) => [d.color[0], d.color[1], d.color[2], 55] as [number, number, number, number],
+            getRadius: (d: Vehicle) => d.uncertainty ?? 0, // meters
+            radiusMinPixels: 4, radiusMaxPixels: 90, pickable: false,
+            updateTriggers: { getPosition: performance.now(), getRadius: performance.now() },
+            parameters: { depthTest: false },
+          }),
+        ]
+      : []),
     new ScatterplotLayer({
       id: "train-glow", data: heads,
       getPosition: (d: Vehicle) => d.position,
@@ -400,7 +418,7 @@ function frame(now: number) {
     if (now - fpsLast > 500) {
       fpsVal = Math.round((fpsCount * 1000) / (now - fpsLast));
       fpsCount = 0; fpsLast = now;
-      statEl.textContent = `${statBase} · ${fpsVal} fps · [B]ldg [G]low [T]rain [V]bus [P]ause [E]levation`;
+      statEl.textContent = `${statBase} · ${fpsVal} fps · [B]ldg [G]low [T]rain [V]bus [P]ause [E]levation [K]alman`;
     }
   } catch (e) {
     console.error("[frame] error (loop continues):", e);
@@ -491,6 +509,7 @@ function applyState(list: any[]) {
       ex.route = s.route; ex.nextStopName = s.nextStopName;
       ex.occStatus = s.occStatus; ex.occPct = s.occPct;
       ex.elevation = s.elevation ?? "underground"; // can change if shape resolution reroutes (express/local)
+      ex.uncertainty = s.uncertainty;
       const drift = s.dist - ex.dist;
       if (Math.abs(drift) > 1500) { ex.dist = s.dist; ex.correct = 0; }
       else ex.correct = drift; // signed; absorbed as gentle speed-up/slow-down in frame()
@@ -503,6 +522,7 @@ function applyState(list: any[]) {
         angle: bearingAt(shapes[s.shapeId], s.dist),
         occStatus: s.occStatus, occPct: s.occPct,
         elevation: s.elevation ?? "underground",
+        uncertainty: s.uncertainty,
       });
     }
   }

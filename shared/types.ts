@@ -17,6 +17,8 @@ export interface VehicleState {
   speed: number; // m/s, for client-side tween
   bearing?: number;
   pos?: [number, number]; // [lon,lat] direct position (buses have GPS, no shape)
+  measuredDist?: number; // raw anchored dist BEFORE the continuity clamp (Kalman input)
+  uncertainty?: number; // √(position variance), meters — from the Kalman sidecar (Phase 2)
   elevation: Elevation;
   nextStop?: string;
   nextStopName?: string;

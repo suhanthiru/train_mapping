@@ -215,6 +215,11 @@ export class Interpolator {
         continue; // nothing to anchor to
       }
 
+      // Raw anchored position BEFORE the clamp — this is the noisy measurement
+      // the Kalman sidecar (Phase 2) filters. The clamp below stays as the
+      // fallback the server uses when the Kalman service is unavailable.
+      const measuredDist = dist;
+
       // Continuity clamp: whatever the formulas above computed, never let the
       // OUTWARD-FACING position regress or jump faster than physically
       // possible since we last placed this vehicle. This is what actually
@@ -241,6 +246,7 @@ export class Interpolator {
         color: route?.color ?? "#3FD8FF",
         shapeId,
         dist,
+        measuredDist,
         speed,
         elevation: this.s.shapeElevation[shapeId] ?? "underground",
         nextStop: nextStopId,

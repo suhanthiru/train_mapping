@@ -20,6 +20,7 @@ const POLL_MS = 30_000; // how often we hit the live feed
 const PUSH_MS = 4_000; // how often we re-interpolate + broadcast fresh positions
 const WEATHER_MS = 5 * 60_000; // how often we sample the weather severity scalar
 const ANALYTICS_PY = process.env.ANALYTICS_PY ?? "http://localhost:8091";
+const KALMAN_RS = process.env.KALMAN_RS ?? "http://localhost:8092";
 const ROOT = process.cwd();
 const DATA_DIR = join(ROOT, "data");
 const WEB_DIST = join(ROOT, "web", "dist");
@@ -41,6 +42,7 @@ const ledger = new PredictionLedger(join(DATA_DIR, "ledger.db"));
 let latest: VehicleState[] = [];
 let lastRaws: RawVehicle[] = [];
 let lastBuses: VehicleState[] = [];
+let kalmanInFlight = false; // guard: never stack overlapping Kalman round-trips
 
 // Poll the live feeds (slow): just refreshes raw predictions/GPS. Does NOT
 // call interp.update() — that would silently advance the same continuity
@@ -90,13 +92,53 @@ async function weatherTick() {
 
 // Single source of truth: re-interpolate + broadcast + record history from
 // the SAME computation, so continuity is judged only against what viewers
-// actually see.
-function pushTick() {
+// actually see. The Kalman sidecar (Phase 2) refines the clamp output with a
+// principled estimate + uncertainty; if it's down/slow the clamp output stands.
+async function pushTick() {
   const now = Math.floor(Date.now() / 1000);
   const trains = interp.update(lastRaws, now);
+  await applyKalman(trains, now);
   latest = [...trains, ...lastBuses];
   history.record(now, trains);
   broadcast({ type: "state", city: "nyc", ts: now, vehicles: latest });
+}
+
+// Send the raw (pre-clamp) measured positions to the Rust Kalman service and
+// overwrite dist/speed with the filtered estimate + attach uncertainty. Any
+// failure (service down, timeout, in-flight) leaves the clamp output untouched.
+async function applyKalman(trains: VehicleState[], now: number): Promise<void> {
+  if (kalmanInFlight) return;
+  const meas = trains
+    .filter((t) => t.measuredDist != null)
+    .map((t) => ({ id: t.id, measuredDist: t.measuredDist, ts: now }));
+  if (!meas.length) return;
+  kalmanInFlight = true;
+  try {
+    const r = await fetch(`${KALMAN_RS}/filter`, {
+      method: "POST",
+      body: JSON.stringify(meas),
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!r.ok) return;
+    const filtered = (await r.json()) as {
+      id: string;
+      filteredDist: number;
+      velocity: number;
+      variance: number;
+    }[];
+    const byId = new Map(filtered.map((f) => [f.id, f]));
+    for (const t of trains) {
+      const f = byId.get(t.id);
+      if (!f) continue;
+      t.dist = f.filteredDist;
+      t.speed = f.velocity;
+      t.uncertainty = Math.sqrt(Math.max(0, f.variance));
+    }
+  } catch {
+    // Kalman down/slow -> keep the clamp output (graceful degrade)
+  } finally {
+    kalmanInFlight = false;
+  }
 }
 
 // --- HTTP: static geometry + built frontend ---
