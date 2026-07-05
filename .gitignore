@@ -1,11 +1,34 @@
+# dependencies
 node_modules/
-.tools/
-dist/
-data/
 web/node_modules/
+.tools/
+
+# build output / compiled binaries
+dist/
 web/dist/
+*.exe
+*.exe~
+
+# data & databases (large / regenerable)
+data/
 *.db
 *.sqlite
 *.sqlite3
+
+# python
+__pycache__/
+*.pyc
+
+# assistant / AI-tool traces (keep local, never push)
+.claude/
+CLAUDE.md
+PLAN_TEST_PATH
+.cursor/
+.aider*
+
+# env / secrets
 .env
+
+# os / editor
 .DS_Store
+Thumbs.db
