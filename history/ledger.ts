@@ -12,6 +12,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { RawVehicle } from "../shared/types.ts";
+import { haversine } from "../shared/geo.ts";
 
 // 30-day retention (longer than history.db's 7d) — this data trains the ETA
 // model AND backs graph analytics, and more history means a better model.
@@ -117,7 +118,9 @@ export class PredictionLedger {
         occ_status    TEXT,
         occ_pct       REAL,
         hour          INTEGER,   -- local hour-of-day of arrival (0-23)
-        dow           INTEGER    -- local day-of-week of arrival (0=Sun)
+        dow           INTEGER,   -- local day-of-week of arrival (0=Sun)
+        distance_m    REAL,      -- straight-line meters from_stop -> to_stop (Phase 2)
+        elevation     TEXT       -- underground/surface/elevated (Phase 2)
       );
       CREATE INDEX IF NOT EXISTS idx_seg_route ON segments(route_id);
       CREATE INDEX IF NOT EXISTS idx_seg_stops ON segments(from_stop, to_stop);
@@ -324,7 +327,12 @@ export class PredictionLedger {
    * enriched with nearest weather + that trip/stop's occupancy + local hour/dow.
    * Cheap full rebuild — call on a slow timer / on demand. Returns rows written.
    */
-  buildSegments(): number {
+  buildSegments(stopPos?: Record<string, [number, number]>, stopElev?: Record<string, string>): number {
+    // idempotent column adds (for ledgers created before Phase 2)
+    for (const col of ["distance_m REAL", "elevation TEXT"]) {
+      try { this.db.exec(`ALTER TABLE segments ADD COLUMN ${col}`); } catch { /* already exists */ }
+    }
+
     const actuals = this.db
       .prepare("SELECT trip_id, stop_id, actual_arrival FROM actuals ORDER BY trip_id, actual_arrival")
       .all() as { trip_id: string; stop_id: string; actual_arrival: number }[];
@@ -337,8 +345,8 @@ export class PredictionLedger {
     );
     const ins = this.db.prepare(
       `INSERT INTO segments
-         (trip_id, route_id, from_stop, to_stop, depart_ts, arrive_ts, travel_sec, weather_score, occ_status, occ_pct, hour, dow)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (trip_id, route_id, from_stop, to_stop, depart_ts, arrive_ts, travel_sec, weather_score, occ_status, occ_pct, hour, dow, distance_m, elevation)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
 
     this.db.exec("BEGIN");
@@ -356,12 +364,16 @@ export class PredictionLedger {
         const wx = wxStmt.get(b.actual_arrival) as { weather_score: number } | undefined;
         const occ = occStmt.get(b.trip_id, b.stop_id) as { occ_status: string; occ_pct: number } | undefined;
         const d = new Date(b.actual_arrival * 1000); // local tz (assumed ET on the host)
+        const pf = stopPos?.[a.stop_id];
+        const pt = stopPos?.[b.stop_id];
+        const distance = pf && pt ? Math.round(haversine(pf, pt)) : null;
+        const elevation = stopElev?.[b.stop_id] ?? stopElev?.[a.stop_id] ?? null;
         ins.run(
           b.trip_id, routeId, a.stop_id, b.stop_id,
           a.actual_arrival, b.actual_arrival, travel,
           wx?.weather_score ?? null,
           occ?.occ_status ?? null, occ?.occ_pct ?? null,
-          d.getHours(), d.getDay()
+          d.getHours(), d.getDay(), distance, elevation
         );
         n++;
       }

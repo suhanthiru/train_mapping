@@ -6,6 +6,7 @@
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { join, extname, normalize } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { fetchNycVehicles } from "../ingest/nyc.ts";
@@ -40,6 +41,19 @@ const stat = loadStatic(join(DATA_DIR, "nyc"));
 const interp = new Interpolator(stat);
 const history = new History(join(DATA_DIR, "history.db"));
 const ledger = new PredictionLedger(join(DATA_DIR, "ledger.db"));
+
+// Stop positions + per-stop elevation, for buildSegments feature enrichment (Phase 2).
+const stopPos: Record<string, [number, number]> = {};
+for (const [id, s] of Object.entries(stat.stops)) stopPos[id] = s.pos;
+const stopElev: Record<string, string> = {};
+try {
+  const shapeElev = JSON.parse(
+    readFileSync(join(DATA_DIR, "nyc", "shapeElevation.json"), "utf8")
+  ) as Record<string, string>;
+  for (const [shapeId, elev] of Object.entries(shapeElev)) {
+    for (const st of stat.shapeStops[shapeId] ?? []) stopElev[st.id] = elev;
+  }
+} catch { /* elevation data optional */ }
 
 let latest: VehicleState[] = [];
 let lastRaws: RawVehicle[] = [];
@@ -420,7 +434,7 @@ server.listen(PORT, () => {
     if (ledgerRemoved) console.log(`[server] pruned ${ledgerRemoved} old ledger rows`);
     // rebuild the segment-traversal table (graph edges + ML training rows)
     try {
-      const segs = ledger.buildSegments();
+      const segs = ledger.buildSegments(stopPos, stopElev);
       console.log(`[server] rebuilt ${segs} segment traversals`);
     } catch (e) {
       console.error("[server] buildSegments failed:", (e as Error).message);
