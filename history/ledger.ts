@@ -444,7 +444,7 @@ export class PredictionLedger {
 
   /** Distribution of travel time by any one model feature (system-wide). */
   featureStats(feature: string): { value: string; avgTravel: number; n: number }[] {
-    const allowed = ["route_id", "from_stop", "to_stop", "hour", "dow", "weather_score", "occ_status"];
+    const allowed = ["route_id", "from_stop", "to_stop", "hour", "dow", "weather_score", "distance_m", "elevation"];
     if (!allowed.includes(feature)) return [];
     return this.db
       .prepare(
@@ -478,6 +478,40 @@ export class PredictionLedger {
         .prepare(`SELECT stop_id, actual_arrival FROM actuals WHERE trip_id = ? ORDER BY actual_arrival`)
         .all(tripId) as any[],
     };
+  }
+
+  /**
+   * Per-arrival drill-down (Phase 6): the most recent completed arrivals, each
+   * with the feed's and the model's LAST prediction before the actual arrival —
+   * the case-by-case "estimated ETA vs ATA" view. errSec = pred - actual (+late),
+   * leadSec = how far before arrival that final belief was.
+   */
+  recentArrivalComparisons(limit = 30): any[] {
+    const actuals = this.db
+      .prepare("SELECT trip_id, stop_id, actual_arrival FROM actuals ORDER BY actual_arrival DESC LIMIT ?")
+      .all(limit) as { trip_id: string; stop_id: string; actual_arrival: number }[];
+    const last = this.db.prepare(
+      `SELECT pred_arrival, observed_at, route_id FROM predictions
+       WHERE trip_id = ? AND stop_id = ? AND source = ? AND observed_at <= ?
+       ORDER BY observed_at DESC LIMIT 1`
+    );
+    const side = (r: any, ata: number) =>
+      r ? { pred: r.pred_arrival, errSec: r.pred_arrival - ata, leadSec: ata - r.observed_at } : null;
+    const out: any[] = [];
+    for (const a of actuals) {
+      const feed = last.get(a.trip_id, a.stop_id, "gtfs-rt", a.actual_arrival) as any;
+      const model = last.get(a.trip_id, a.stop_id, "model-v1", a.actual_arrival) as any;
+      if (!feed && !model) continue;
+      out.push({
+        tripId: a.trip_id,
+        stopId: a.stop_id,
+        routeId: feed?.route_id ?? model?.route_id ?? null,
+        actualArrival: a.actual_arrival,
+        feed: side(feed, a.actual_arrival),
+        model: side(model, a.actual_arrival),
+      });
+    }
+    return out;
   }
 
   close(): void {

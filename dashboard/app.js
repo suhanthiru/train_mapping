@@ -121,21 +121,29 @@ async function loadHeadToHead() {
   });
 }
 async function loadTrend() {
-  const d = await getJSON(`${BACKEND}/api/accuracy-trend?source=gtfs-rt`);
-  const pts = d.points || [];
-  if (!pts.length) { charts.trend?.destroy(); return; }
-  // group by lead bucket -> line per bucket
-  const byLabel = {};
-  for (const p of pts) (byLabel[p.leadLabel] ??= []).push(p);
-  const times = [...new Set(pts.map((p) => p.ts))].sort();
-  const palette = ["#3FD8FF", "#7ed957", "#f0c040", "#f0902f", "#e53950"];
-  const ds = Object.entries(byLabel).map(([label, arr], i) => {
-    const m = new Map(arr.map((p) => [p.ts, p.maeSec]));
-    return { label, data: times.map((t) => m.get(t) ?? null), borderColor: palette[i % palette.length], spanGaps: true, tension: 0.3, pointRadius: 2 };
-  });
+  // feed vs model overall MAE over time (n-weighted average across lead buckets)
+  const [feed, model] = await Promise.all([
+    getJSON(`${BACKEND}/api/accuracy-trend?source=gtfs-rt`),
+    getJSON(`${BACKEND}/api/accuracy-trend?source=model-v1`),
+  ]);
+  const overall = (pts) => {
+    const byTs = {};
+    for (const p of pts || []) { (byTs[p.ts] ??= { s: 0, n: 0 }); byTs[p.ts].s += p.maeSec * p.n; byTs[p.ts].n += p.n; }
+    return byTs;
+  };
+  const f = overall(feed.points), m = overall(model.points);
+  const times = [...new Set([...Object.keys(f), ...Object.keys(m)].map(Number))].sort((a, b) => a - b);
+  if (!times.length) { charts.trend?.destroy(); return; }
+  const line = (map) => times.map((t) => (map[t] && map[t].n ? Math.round(map[t].s / map[t].n) : null));
   draw("trend", {
     type: "line",
-    data: { labels: times.map((t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })), datasets: ds },
+    data: {
+      labels: times.map((t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })),
+      datasets: [
+        { label: "feed MAE", data: line(f), borderColor: ACCENT, spanGaps: true, tension: 0.3, pointRadius: 2 },
+        { label: "model MAE", data: line(m), borderColor: "#f0902f", spanGaps: true, tension: 0.3, pointRadius: 2 },
+      ],
+    },
     options: { responsive: true, maintainAspectRatio: false, scales: axes("MAE (s)") },
   });
 }
@@ -164,6 +172,33 @@ async function loadFeature() {
     data: { labels: s.map((x) => x.value), datasets: [{ label: "avg travel (s)", data: s.map((x) => x.avgTravel), backgroundColor: ACCENT, borderRadius: 4 }] },
     options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: axes("avg travel (s)") },
   });
+}
+
+// ---- recent arrivals scorecard: estimated ETA vs ATA, case by case ----
+async function loadRecentArrivals() {
+  let d;
+  try { d = await getJSON(`${BACKEND}/api/recent-arrivals`); }
+  catch { document.getElementById("recent-table").innerHTML = '<div class="empty">backend not reachable</div>'; return; }
+  const rows = d.rows || [];
+  if (!rows.length) { document.getElementById("recent-table").innerHTML = '<div class="empty">no graded arrivals yet</div>'; return; }
+  const fmtT = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const cell = (s) => (s ? `${s.errSec >= 0 ? "+" : ""}${s.errSec}s` : "–");
+  const closer = (r) => {
+    if (!r.feed || !r.model) return "";
+    const winner = Math.abs(r.feed.errSec) <= Math.abs(r.model.errSec) ? "feed" : "model";
+    const col = winner === "feed" ? "#3FD8FF" : "#f0902f";
+    return `<span style="color:${col}">${winner}</span>`;
+  };
+  document.getElementById("recent-table").innerHTML =
+    `<table><thead><tr><th>ATA</th><th>route</th><th>station</th><th>feed Δ</th><th>model Δ</th><th>closer</th></tr></thead><tbody>` +
+    rows.map((r) => `<tr>
+      <td>${fmtT(r.actualArrival)}</td>
+      <td><span class="route-badge" style="background:#1f2937">${r.route}</span></td>
+      <td>${r.station}</td>
+      <td style="color:${r.feed ? "#3FD8FF" : "var(--muted)"}">${cell(r.feed)}</td>
+      <td style="color:${r.model ? "#f0902f" : "var(--muted)"}">${cell(r.model)}</td>
+      <td>${closer(r)}</td></tr>`).join("") +
+    `</tbody></table>`;
 }
 
 // ---- per-train ----
@@ -205,7 +240,7 @@ document.getElementById("loadtrip").onclick = loadTrip;
 async function refresh() {
   try {
     const d = await loadCounts();
-    await Promise.all([loadKalman(), loadAccuracy(d), loadHeadToHead(), loadTrend(), loadImportance(), loadFeature()]);
+    await Promise.all([loadKalman(), loadAccuracy(d), loadHeadToHead(), loadRecentArrivals(), loadTrend(), loadImportance(), loadFeature()]);
     document.getElementById("status").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) {
     document.getElementById("status").textContent = "error: " + e.message;

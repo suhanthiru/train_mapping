@@ -351,6 +351,16 @@ const server = createServer(async (req, res) => {
     );
     return;
   }
+  // Per-arrival drill-down: recent arrivals with feed vs model vs actual (Phase 6).
+  if (url === "/api/recent-arrivals") {
+    const rows = ledger.recentArrivalComparisons(30).map((r) => ({
+      ...r,
+      route: stat.routes[r.routeId]?.shortName ?? r.routeId,
+      station: stat.stops[r.stopId]?.name ?? stat.stops[String(r.stopId).replace(/[NS]$/, "")]?.name ?? r.stopId,
+    }));
+    res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ rows }));
+    return;
+  }
 
   // Live arrivals board for a station (matches both direction platforms).
   if (url === "/api/arrivals") {
