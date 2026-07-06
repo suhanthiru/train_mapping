@@ -27,15 +27,17 @@ LEDGER = os.path.join(HERE, "..", "data", "ledger.db")
 OUT_MODEL = os.path.join(HERE, "eta_model.json")
 OUT_FEATS = os.path.join(HERE, "eta_features.json")
 
-CAT = ["route_id", "from_stop", "to_stop"]
-NUM = ["hour", "dow", "weather_score", "occ_pct"]
+# Phase 4: distance_m + elevation added; dead occ_pct dropped.
+CAT = ["route_id", "from_stop", "to_stop", "elevation"]
+NUM = ["hour", "dow", "weather_score", "distance_m"]
 FEAT_ORDER = CAT + NUM
 
 
-def main():
+def train():
+    """Train the ETA model from the segments table; returns (mae, n)."""
     con = sqlite3.connect(LEDGER)
     cur = con.execute(
-        "SELECT route_id, from_stop, to_stop, hour, dow, weather_score, occ_pct, travel_sec "
+        "SELECT route_id, from_stop, to_stop, elevation, hour, dow, weather_score, distance_m, travel_sec "
         "FROM segments WHERE travel_sec IS NOT NULL"
     )
     cols = [d[0] for d in cur.description]
@@ -45,9 +47,9 @@ def main():
     if not rows:
         print("[train] no segments yet — run the backend to collect data (npm run "
               "server), let it build segments, then retry.")
-        return
+        return (None, 0)
 
-    df = pl.DataFrame(rows)  # polars for a quick sanity read
+    df = pl.DataFrame(rows, infer_schema_length=None)  # scan all rows (mixed null/value cols)
     n = len(rows)
     print(f"[train] {n} segments · {df['route_id'].n_unique()} routes · "
           f"travel_sec mean={df['travel_sec'].mean():.1f}s")
@@ -89,7 +91,8 @@ def main():
         }, f, indent=2)
     print(f"[train] wrote {OUT_MODEL} + {OUT_FEATS}")
     print(f"[train] feature importance (gain): {imp_named}")
+    return (round(mae, 1), n)
 
 
 if __name__ == "__main__":
-    main()
+    train()

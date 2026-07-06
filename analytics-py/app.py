@@ -91,12 +91,15 @@ def feature_importance():
     }
 
 
-def _feature_row(enc, route_id, from_stop, to_stop, hour, dow, weather_score, occ_pct):
+# Feature order MUST match train_eta.py FEAT_ORDER:
+# [route_id, from_stop, to_stop, elevation, hour, dow, weather_score, distance_m]
+def _feature_row(enc, route_id, from_stop, to_stop, elevation, hour, dow, weather_score, distance_m):
     return [
         enc["route_id"].get(str(route_id), -1),
         enc["from_stop"].get(str(from_stop), -1),
         enc["to_stop"].get(str(to_stop), -1),
-        float(hour), float(dow), float(weather_score), float(occ_pct),
+        enc["elevation"].get(str(elevation), -1),
+        float(hour), float(dow), float(weather_score), float(distance_m),
     ]
 
 
@@ -108,12 +111,13 @@ def predict(
     hour: int = 12,
     dow: int = 1,
     weather_score: float = 0.0,
-    occ_pct: float = 0.0,
+    distance_m: float = 0.0,
+    elevation: str = "underground",
 ):
     if _model is None or _feats is None:
         return JSONResponse({"error": "model not trained yet — run train_eta.py"}, status_code=503)
     enc = _feats["encoders"]
-    row = _feature_row(enc, route_id, from_stop, to_stop, hour, dow, weather_score, occ_pct)
+    row = _feature_row(enc, route_id, from_stop, to_stop, elevation, hour, dow, weather_score, distance_m)
     X = np.array([row], dtype=np.float32)
     pred = float(_model.predict(X)[0])
     return {"predicted_travel_sec": round(pred, 1), "source": "model-v1"}
@@ -127,7 +131,8 @@ class HopRequest(BaseModel):
     hour: int = 12
     dow: int = 1
     weather_score: float = 0.0
-    occ_pct: float = 0.0
+    distance_m: float = 0.0
+    elevation: str = "underground"
 
 
 @app.post("/predict-batch")
@@ -142,7 +147,7 @@ def predict_batch(hops: list[HopRequest]):
         return []
     enc = _feats["encoders"]
     X = np.array(
-        [_feature_row(enc, h.route_id, h.from_stop, h.to_stop, h.hour, h.dow, h.weather_score, h.occ_pct) for h in hops],
+        [_feature_row(enc, h.route_id, h.from_stop, h.to_stop, h.elevation, h.hour, h.dow, h.weather_score, h.distance_m) for h in hops],
         dtype=np.float32,
     )
     preds = _model.predict(X)

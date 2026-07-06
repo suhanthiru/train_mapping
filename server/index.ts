@@ -13,6 +13,7 @@ import { fetchNycVehicles } from "../ingest/nyc.ts";
 import { fetchNycBuses } from "../ingest/nyc-bus.ts";
 import { fetchNycAlerts } from "../ingest/nyc-alerts.ts";
 import { Interpolator, loadStatic } from "../core/interpolate.ts";
+import { haversine } from "../shared/geo.ts";
 import { History } from "../history/db.ts";
 import { PredictionLedger } from "../history/ledger.ts";
 import type { VehicleState, RawVehicle } from "../shared/types.ts";
@@ -133,7 +134,7 @@ async function modelPredictTick(raws: RawVehicle[]): Promise<void> {
   const hour = nowDate.getHours();
   const dow = nowDate.getDay();
 
-  interface HopReq { id: string; route_id: string; from_stop: string; to_stop: string; hour: number; dow: number; weather_score: number; occ_pct: number }
+  interface HopReq { id: string; route_id: string; from_stop: string; to_stop: string; hour: number; dow: number; weather_score: number; distance_m: number; elevation: string }
   interface VehHops { tripId: string; routeId: string; feedTimestamp: number; hopIds: string[]; targetStops: string[] }
 
   const hopReqs: HopReq[] = [];
@@ -150,9 +151,14 @@ async function modelPredictTick(raws: RawVehicle[]): Promise<void> {
       if (!to) continue;
       const from = i === 0 ? anchor : v.upcoming[i - 1].stopId;
       const id = `${v.tripId}|${i}`;
+      // distance + elevation must match how buildSegments computes them (Phase 2)
+      const pf = stopPos[from];
+      const pt = stopPos[to];
+      const distance_m = pf && pt ? Math.round(haversine(pf, pt)) : 0;
+      const elevation = stopElev[to] ?? stopElev[from] ?? "underground";
       hopReqs.push({
         id, route_id: v.routeId, from_stop: from, to_stop: to,
-        hour, dow, weather_score: lastWeatherScore, occ_pct: v.occPct ?? 0,
+        hour, dow, weather_score: lastWeatherScore, distance_m, elevation,
       });
       hopIds.push(id);
       targetStops.push(to);
