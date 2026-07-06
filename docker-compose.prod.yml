@@ -1,0 +1,23 @@
+# Production overrides for an always-on host (the real "survives sleep/shutdown"
+# answer — see DEPLOY.md). Layer on top of the base compose:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+# Adds auto-restart (survives crashes + host reboots) and bounded logs.
+x-prod: &prod
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  kalman-rs:
+    <<: *prod
+  analytics-py:
+    <<: *prod
+  backend:
+    <<: *prod
+  analytics-go:
+    <<: *prod
+  dashboard:
+    <<: *prod
