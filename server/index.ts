@@ -10,6 +10,7 @@ import { join, extname, normalize } from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import { fetchNycVehicles } from "../ingest/nyc.ts";
 import { fetchNycBuses } from "../ingest/nyc-bus.ts";
+import { fetchNycAlerts } from "../ingest/nyc-alerts.ts";
 import { Interpolator, loadStatic } from "../core/interpolate.ts";
 import { History } from "../history/db.ts";
 import { PredictionLedger } from "../history/ledger.ts";
@@ -19,6 +20,7 @@ const PORT = Number(process.env.PORT ?? 8080);
 const POLL_MS = 30_000; // how often we hit the live feed
 const PUSH_MS = 4_000; // how often we re-interpolate + broadcast fresh positions
 const WEATHER_MS = 5 * 60_000; // how often we sample the weather severity scalar
+const ALERTS_MS = 2 * 60_000; // how often we snapshot active service alerts
 const ANALYTICS_PY = process.env.ANALYTICS_PY ?? "http://localhost:8091";
 const KALMAN_RS = process.env.KALMAN_RS ?? "http://localhost:8092";
 const ROOT = process.cwd();
@@ -90,6 +92,17 @@ async function weatherTick() {
     );
   } catch (e) {
     console.error("[server] weather sample skipped:", (e as Error).message);
+  }
+}
+
+// Forward-only logger (Phase 1): snapshot active service alerts (which lines are
+// slow/delayed/rerouted right now). Degrades to a gap if the feed is down.
+async function alertsTick() {
+  try {
+    const alerts = await fetchNycAlerts();
+    ledger.recordAlerts(Math.floor(Date.now() / 1000), alerts);
+  } catch (e) {
+    console.error("[server] alerts sample skipped:", (e as Error).message);
   }
 }
 
@@ -174,7 +187,48 @@ async function pushTick() {
   await applyKalman(trains, now);
   latest = [...trains, ...lastBuses];
   history.record(now, trains);
+  logVehicleState(trains, now);
   broadcast({ type: "state", city: "nyc", ts: now, vehicles: latest });
+}
+
+const CONGEST_WINDOW_M = 1200; // same-shape trains within this many meters ahead = congestion
+
+// Forward-only logger (Phase 1): Kalman progress into the current hop + live
+// congestion, per subway train. Change-detected inside the ledger. try/catch
+// so a logging hiccup never disrupts the broadcast.
+function logVehicleState(trains: VehicleState[], now: number): void {
+  try {
+    const byShape = new Map<string, VehicleState[]>();
+    for (const t of trains) {
+      if (!t.shapeId) continue;
+      let arr = byShape.get(t.shapeId);
+      if (!arr) { arr = []; byShape.set(t.shapeId, arr); }
+      arr.push(t);
+    }
+    const rows = [];
+    for (const t of trains) {
+      if (!t.shapeId) continue;
+      const hop = interp.currentHop(t.shapeId, t.dist);
+      if (!hop) continue;
+      const peers = byShape.get(t.shapeId)!;
+      let ahead = 0;
+      for (const p of peers) if (p !== t && p.dist > t.dist && p.dist <= t.dist + CONGEST_WINDOW_M) ahead++;
+      rows.push({
+        ts: now,
+        tripId: t.id.replace(/^nyc:/, ""),
+        route: t.route,
+        fromStop: hop.fromStop,
+        toStop: hop.toStop,
+        fracHop: hop.frac,
+        kalmanSpeed: t.speed,
+        uncertainty: t.uncertainty ?? 0,
+        trainsAhead: ahead,
+      });
+    }
+    if (rows.length) ledger.recordVehicleLog(rows);
+  } catch (e) {
+    console.error("[server] vehicle_log skipped:", (e as Error).message);
+  }
 }
 
 // Send the raw (pre-clamp) measured positions to the Rust Kalman service and
@@ -350,6 +404,8 @@ server.listen(PORT, () => {
   setInterval(pushTick, PUSH_MS);
   weatherTick(); // sample once at boot, then on a slow timer
   setInterval(weatherTick, WEATHER_MS);
+  alertsTick(); // snapshot service alerts at boot, then on a slow timer
+  setInterval(alertsTick, ALERTS_MS);
   // Accuracy snapshots (Phase 4): trend the backtest over time for the dashboard.
   const snap = () => {
     try { ledger.recordAccuracySnapshot("gtfs-rt"); ledger.recordAccuracySnapshot("model-v1"); }

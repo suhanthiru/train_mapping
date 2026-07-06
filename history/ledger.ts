@@ -35,8 +35,12 @@ export class PredictionLedger {
   private insCond;
   private insModelPred;
   private insAccSnap;
+  private insVehLog;
+  private insAlert;
   // in-memory change-detection: "tripId|stopId" -> last logged pred_arrival
   private lastPred = new Map<string, number>();
+  // vehicle_log change-detection: tripId -> last {toStop, frac, ahead}
+  private lastVehLog = new Map<string, { toStop: string; frac: number; ahead: number }>();
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -70,6 +74,33 @@ export class PredictionLedger {
         conditions    TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_cond_ts ON conditions(ts);
+
+      -- Forward-only feature loggers (Phase 1): live quantities that CANNOT be
+      -- backfilled, so they must be captured continuously going forward.
+      CREATE TABLE IF NOT EXISTS vehicle_log (
+        ts           INTEGER NOT NULL,
+        trip_id      TEXT NOT NULL,
+        route        TEXT,
+        from_stop    TEXT,     -- current hop the train is in
+        to_stop      TEXT,
+        frac_hop     REAL,     -- 0..1 position within the current hop (from Kalman dist)
+        kalman_speed REAL,     -- m/s, filtered
+        uncertainty  REAL,     -- sqrt(position variance), meters
+        trains_ahead INTEGER   -- congestion: same-shape trains within a window ahead
+      );
+      CREATE INDEX IF NOT EXISTS idx_vehlog_ts ON vehicle_log(ts);
+      CREATE INDEX IF NOT EXISTS idx_vehlog_trip ON vehicle_log(trip_id, to_stop, ts);
+
+      CREATE TABLE IF NOT EXISTS alerts_log (
+        ts         INTEGER NOT NULL,
+        route_id   TEXT,
+        direction  TEXT,     -- N/S when known
+        alert_type TEXT,     -- e.g. planned_work / alert
+        severity   INTEGER,  -- MTA code (Slow Speeds=16, Delays=22, Suspended=39)
+        header     TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts_log(ts);
+      CREATE INDEX IF NOT EXISTS idx_alerts_route ON alerts_log(route_id, ts);
 
       -- Materialized segment traversals: one row per consecutive (from_stop ->
       -- to_stop) hop per trip. Simultaneously the graph EDGE LIST (nodes=stops)
@@ -120,6 +151,13 @@ export class PredictionLedger {
     );
     this.insAccSnap = this.db.prepare(
       `INSERT INTO accuracy_snapshots (ts, source, lead_label, n, mae_sec, bias_sec) VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    this.insVehLog = this.db.prepare(
+      `INSERT INTO vehicle_log (ts, trip_id, route, from_stop, to_stop, frac_hop, kalman_speed, uncertainty, trains_ahead)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    this.insAlert = this.db.prepare(
+      `INSERT INTO alerts_log (ts, route_id, direction, alert_type, severity, header) VALUES (?, ?, ?, ?, ?, ?)`
     );
   }
 
@@ -199,6 +237,45 @@ export class PredictionLedger {
   /** Sample the current city weather severity (0-100) into the ledger. */
   recordConditions(ts: number, score: number | null, tempF: number | null, precipitating: boolean, conditions: string | null): void {
     this.insCond.run(ts, score, tempF, precipitating ? 1 : 0, conditions);
+  }
+
+  /**
+   * Log forward-only per-vehicle state: Kalman progress into the current hop +
+   * live congestion (trains ahead). Change-detected — only writes when a train
+   * meaningfully advances (frac moved >0.1), changes hop, or its congestion
+   * count changes — so the 4s tick doesn't flood the table. CANNOT be
+   * backfilled, which is why it must be captured live.
+   */
+  recordVehicleLog(rows: { ts: number; tripId: string; route: string; fromStop: string; toStop: string; fracHop: number; kalmanSpeed: number; uncertainty: number; trainsAhead: number }[]): void {
+    this.db.exec("BEGIN");
+    try {
+      for (const r of rows) {
+        const prev = this.lastVehLog.get(r.tripId);
+        if (prev && prev.toStop === r.toStop && Math.abs(prev.frac - r.fracHop) < 0.1 && prev.ahead === r.trainsAhead) {
+          continue; // no material change — skip
+        }
+        this.lastVehLog.set(r.tripId, { toStop: r.toStop, frac: r.fracHop, ahead: r.trainsAhead });
+        this.insVehLog.run(r.ts, r.tripId, r.route, r.fromStop, r.toStop, r.fracHop, r.kalmanSpeed, r.uncertainty, r.trainsAhead);
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
+  }
+
+  /** Snapshot the currently-active service alerts (one row per alert per sample). */
+  recordAlerts(ts: number, alerts: { routeId: string; direction: string; alertType: string; severity: number; header: string }[]): void {
+    this.db.exec("BEGIN");
+    try {
+      for (const a of alerts) {
+        this.insAlert.run(ts, a.routeId, a.direction || null, a.alertType, a.severity, a.header);
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
   }
 
   /**
@@ -305,13 +382,15 @@ export class PredictionLedger {
     removed += Number(this.db.prepare("DELETE FROM conditions WHERE ts < ?").run(cutoff).changes ?? 0);
     removed += Number(this.db.prepare("DELETE FROM segments WHERE arrive_ts < ?").run(cutoff).changes ?? 0);
     removed += Number(this.db.prepare("DELETE FROM accuracy_snapshots WHERE ts < ?").run(cutoff).changes ?? 0);
-    // forget stale change-detection keys so the map doesn't grow unbounded
+    removed += Number(this.db.prepare("DELETE FROM vehicle_log WHERE ts < ?").run(cutoff).changes ?? 0);
+    removed += Number(this.db.prepare("DELETE FROM alerts_log WHERE ts < ?").run(cutoff).changes ?? 0);
+    // forget stale change-detection keys so the maps don't grow unbounded
     for (const [k, t] of this.lastPred) if (t < cutoff) this.lastPred.delete(k);
     return removed;
   }
 
   /** Row counts for quick verification / status. */
-  counts(): { predictions: number; actuals: number; conditions: number; segments: number } {
+  counts(): { predictions: number; actuals: number; conditions: number; segments: number; vehicle_log: number; alerts_log: number } {
     const one = (t: string) =>
       Number((this.db.prepare(`SELECT COUNT(*) AS c FROM ${t}`).get() as { c: number }).c);
     return {
@@ -319,6 +398,8 @@ export class PredictionLedger {
       actuals: one("actuals"),
       conditions: one("conditions"),
       segments: one("segments"),
+      vehicle_log: one("vehicle_log"),
+      alerts_log: one("alerts_log"),
     };
   }
 

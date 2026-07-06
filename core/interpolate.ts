@@ -159,6 +159,27 @@ export class Interpolator {
     return null;
   }
 
+  /**
+   * The hop a train is currently inside: the stop pair bracketing `dist`, plus
+   * how far along it is (0..1). Public — the server uses it to log Kalman
+   * progress into the current segment (Phase 1 vehicle_log).
+   */
+  currentHop(shapeId: string, dist: number): { fromStop: string; toStop: string; frac: number } | null {
+    const list = this.s.shapeStops[shapeId];
+    if (!list || list.length < 2) return null;
+    for (let i = 0; i < list.length - 1; i++) {
+      if (dist >= list[i].dist && dist < list[i + 1].dist) {
+        const seg = list[i + 1].dist - list[i].dist || 1;
+        return {
+          fromStop: list[i].id,
+          toStop: list[i + 1].id,
+          frac: Math.max(0, Math.min(1, (dist - list[i].dist) / seg)),
+        };
+      }
+    }
+    return null;
+  }
+
   /** distance of the first stop after a given distance. */
   private nextStopDist(shapeId: string, dist: number): number | null {
     const list = this.s.shapeStops[shapeId];
