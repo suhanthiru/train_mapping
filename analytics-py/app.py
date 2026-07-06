@@ -10,6 +10,8 @@ the train-heavy / serve-light shape and a typed, auto-documented /predict API.
 """
 import json
 import os
+import threading
+import time
 from typing import Optional
 
 import numpy as np
@@ -21,6 +23,10 @@ from pydantic import BaseModel
 
 import weather
 import nyc311
+import train_eta
+import build_goldenset
+
+RETRAIN_EVERY_S = 6 * 3600  # continuous retraining cadence
 
 HERE = os.path.dirname(__file__)
 MODEL_PATH = os.path.join(HERE, "eta_model.json")
@@ -47,10 +53,47 @@ def load_model():
 
 load_model()
 
+# --- continuous retraining (Phase 5): retrain from the growing ledger, hot-reload
+# the model with no downtime, and snapshot the golden set. Runs on a daemon timer
+# + on demand via POST /retrain. ---
+_model_status = {"last_trained": None, "mae": None, "n_train": None}
+
+
+def do_retrain():
+    global _model_status
+    try:
+        mae, n = train_eta.train()
+        load_model()  # hot-reload the freshly-written model — no restart
+        _model_status = {"last_trained": int(time.time()), "mae": mae, "n_train": n}
+        try:
+            build_goldenset.main()  # refresh the frozen experimentation dataset
+        except Exception as e:
+            print("[retrain] goldenset snapshot skipped:", e)
+        print(f"[retrain] done: mae={mae}s n={n}")
+        return True
+    except Exception as e:
+        print("[retrain] failed:", e)
+        return False
+
+
+def _scheduler():
+    while True:
+        time.sleep(RETRAIN_EVERY_S)
+        do_retrain()
+
+
+threading.Thread(target=_scheduler, daemon=True).start()
+
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model_loaded": _model is not None}
+    return {"ok": True, "model_loaded": _model is not None, **_model_status}
+
+
+@app.post("/retrain")
+def retrain():
+    ok = do_retrain()
+    return {"ok": ok, **_model_status}
 
 
 @app.get("/context")

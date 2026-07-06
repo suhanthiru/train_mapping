@@ -148,6 +148,13 @@ async function loadTrend() {
   });
 }
 async function loadImportance() {
+  // model status line (retrain loop visibility)
+  try {
+    const h = await getJSON(`${ANALYTICS}/health`);
+    const when = h.last_trained ? new Date(h.last_trained * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "startup";
+    document.getElementById("model-status").textContent =
+      `model-v1 · trained on ${(h.n_train ?? 0).toLocaleString()} segments · in-sample MAE ${h.mae ?? "—"}s · last retrained ${when}`;
+  } catch { /* leave default */ }
   try {
     const d = await getJSON(`${ANALYTICS}/feature-importance`);
     const imp = d.importance || {};
