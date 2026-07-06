@@ -1,0 +1,87 @@
+"""Build the GOLDEN SET: one frozen row per completed arrival, joining the
+backfillable features (from `segments`) with the feed's ETAs at 10/5/1 min
+before arrival and the forward-only signals (Kalman progress, congestion,
+alerts) as-of those leads, plus the ATA (ground truth). Written to Parquet so
+every future experimental model trains/tests on the IDENTICAL, prune-immune
+dataset — the closed environment for feature A/B experiments.
+
+Run: python analytics-py/build_goldenset.py  (or on the auto-retrain schedule)
+"""
+import os
+import sqlite3
+from datetime import datetime, timezone
+
+import polars as pl
+
+HERE = os.path.dirname(__file__)
+LEDGER = os.path.join(HERE, "..", "data", "ledger.db")
+OUTDIR = os.path.join(HERE, "..", "data", "exports", "goldenset")
+
+
+def main():
+    con = sqlite3.connect(LEDGER)
+    cur = con.cursor()
+    segs = cur.execute(
+        "SELECT trip_id, route_id, from_stop, to_stop, arrive_ts, travel_sec, "
+        "distance_m, elevation, hour, dow, weather_score FROM segments "
+        "WHERE arrive_ts IS NOT NULL"
+    ).fetchall()
+    cols = [d[0] for d in cur.description]
+
+    def feed_eta(trip, stop, before_ts):
+        r = cur.execute(
+            "SELECT pred_arrival FROM predictions WHERE trip_id=? AND stop_id=? "
+            "AND source='gtfs-rt' AND observed_at<=? ORDER BY observed_at DESC LIMIT 1",
+            (trip, stop, before_ts),
+        ).fetchone()
+        return r[0] if r else None
+
+    def vlog(trip, ts):
+        r = cur.execute(
+            "SELECT frac_hop, trains_ahead FROM vehicle_log WHERE trip_id=? AND ts<=? "
+            "ORDER BY ts DESC LIMIT 1",
+            (trip, ts),
+        ).fetchone()
+        return (r[0], r[1]) if r else (None, None)
+
+    def alert_active(route, ts):
+        r = cur.execute(
+            "SELECT COUNT(*) FROM alerts_log WHERE route_id=? AND ts BETWEEN ? AND ?",
+            (route, ts - 200, ts + 200),
+        ).fetchone()
+        return 1 if (r and r[0]) else 0
+
+    rows = []
+    for s in segs:
+        d = dict(zip(cols, s))
+        ata, trip, to, route = d["arrive_ts"], d["trip_id"], d["to_stop"], d["route_id"]
+        d["ata"] = ata
+        d["feed_eta_10min"] = feed_eta(trip, to, ata - 600)
+        d["feed_eta_5min"] = feed_eta(trip, to, ata - 300)
+        d["feed_eta_1min"] = feed_eta(trip, to, ata - 60)
+        for lead, col in ((600, "feed_err_10min"), (300, "feed_err_5min"), (60, "feed_err_1min")):
+            k = {"600": "feed_eta_10min", "300": "feed_eta_5min", "60": "feed_eta_1min"}[str(lead)]
+            d[col] = (d[k] - ata) if d[k] is not None else None
+        fr, ah = vlog(trip, ata - 300)  # forward-only, as-of ~5 min out
+        d["frac_hop_5min"], d["trains_ahead_5min"] = fr, ah
+        d["direction"] = to[-1] if to and to[-1] in "NS" else ""
+        d["alert_active"] = alert_active(route, ata)
+        rows.append(d)
+    con.close()
+
+    if not rows:
+        print("[goldenset] no segments yet — collect data first.")
+        return
+
+    df = pl.DataFrame(rows, infer_schema_length=None)
+    os.makedirs(OUTDIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    path = os.path.join(OUTDIR, f"goldenset_{stamp}.parquet")
+    df.write_parquet(path)
+    have_feed = df.filter(pl.col("feed_eta_5min").is_not_null()).height
+    print(f"[goldenset] wrote {len(rows)} rows ({have_feed} with a 5-min feed ETA) -> {path}")
+    print(f"[goldenset] columns: {df.columns}")
+
+
+if __name__ == "__main__":
+    main()
