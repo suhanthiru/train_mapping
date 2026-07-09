@@ -32,15 +32,29 @@
   th { color:var(--muted); font-weight:500; }
   .hidden { display:none; }
   .empty { color:var(--muted); font-size:12.5px; padding:8px 0; }
+  /* Simple mode: technical panels/controls carry .jargon and vanish; the
+     plain-English summary carries .plain-only and only appears here. */
+  body.simple .jargon { display:none !important; }
+  .plain-only { display:none; }
+  body.simple .plain-only { display:block; }
+  .plain-toggle { background:var(--panel); color:var(--muted); border:1px solid var(--line); border-radius:8px; padding:6px 14px; cursor:pointer; font-size:13px; }
+  .plain-toggle.on { color:#0a0e14; background:var(--accent); border-color:var(--accent); font-weight:600; }
+  .plain-card { background:var(--bg); border-radius:8px; padding:14px 16px; font-size:15px; line-height:1.65; margin-bottom:10px; }
+  .plain-card:last-child { margin-bottom:0; }
+  .plain-card b { color:var(--accent); }
+  .plain-good b { color:#7ed957; }
+  .plain-bad b { color:#f0902f; }
+  .plain-emoji { margin-right:6px; }
 </style>
 </head>
 <body>
 <header>
   <h1><span>◆</span> Transit Analytics <span style="color:var(--muted);font-weight:400">· model + Kalman</span></h1>
-  <div class="modes">
+  <div class="modes jargon">
     <button id="mode-system" class="on">System-wide</button>
     <button id="mode-train">Per-train</button>
   </div>
+  <button id="mode-plain" class="plain-toggle">💬 Explain Simply</button>
   <div id="status">loading…</div>
 </header>
 
@@ -48,44 +62,53 @@
   <!-- SYSTEM VIEW -->
   <section id="view-system">
     <div class="grid">
-      <div class="panel">
+      <div class="panel plain-only" id="plain-summary" style="grid-column: 1 / -1;">
+        <h2>💬 In Plain English</h2>
+        <div id="plain-content"><div class="empty">loading…</div></div>
+      </div>
+      <div class="panel jargon" style="grid-column: span 2;">
+        <h2>System health</h2>
+        <div class="sub">is the pipeline alive right now — feed freshness, write rates, model status</div>
+        <div class="cards" id="syshealth"><div class="empty">loading…</div></div>
+      </div>
+      <div class="panel jargon">
         <h2>Ledger</h2>
         <div class="sub">live data collected so far</div>
         <div class="cards" id="counts"></div>
       </div>
-      <div class="panel">
+      <div class="panel jargon">
         <h2>Kalman filter (live)</h2>
         <div class="sub">present-state estimator · vs the 5.72 m/s clamp baseline</div>
         <div class="cards" id="kalman"></div>
       </div>
-      <div class="panel">
+      <div class="panel jargon">
         <h2>Feed ETA accuracy (MAE by lead time)</h2>
-        <div class="sub">how far off the agency feed's arrival predictions are</div>
+        <div class="sub">how far off the agency feed's arrival predictions are · rolling last 6h (full history: npm run report:backtest)</div>
         <div class="chartbox"><canvas id="acc"></canvas></div>
       </div>
-      <div class="panel" style="grid-column: span 2;">
-        <h2>Prediction showdown — feed vs. model</h2>
-        <div class="sub">head-to-head grading: agency feed (gtfs-rt) vs. our XGBoost model (model-v1), same ledger, same rules</div>
+      <div class="panel jargon" style="grid-column: span 2;">
+        <h2>Prediction showdown — feed vs. models</h2>
+        <div class="sub">head-to-head grading: agency feed (gtfs-rt) vs. model-v1 (full-hop chaining) vs. model-v2 (frac_hop remaining-time — the late-bias fix), same ledger, same rules · rolling last 6h</div>
         <div class="cards" id="h2h-cards" style="margin-bottom:10px;"></div>
         <div class="chartbox"><canvas id="h2h"></canvas></div>
         <div class="chartbox" style="height:150px;"><canvas id="h2h-bias"></canvas></div>
       </div>
       <div class="panel" style="grid-column: span 2;">
-        <h2>Recent arrivals — estimated ETA vs. actual (ATA)</h2>
-        <div class="sub">the last 30 stops trains actually reached · each source's final prediction vs. what happened (Δ = predicted − actual, + is late)</div>
+        <h2 id="recent-title">Recent arrivals — estimated ETA vs. actual (ATA)</h2>
+        <div class="sub" id="recent-sub">the last 30 stops trains actually reached · each source's final prediction vs. what happened (Δ = predicted − actual, + is late)</div>
         <div id="recent-table"><div class="empty">loading…</div></div>
       </div>
-      <div class="panel">
+      <div class="panel jargon">
         <h2>Accuracy over time</h2>
         <div class="sub">MAE trend from periodic snapshots (accrues as it runs)</div>
         <div class="chartbox"><canvas id="trend"></canvas></div>
       </div>
-      <div class="panel">
+      <div class="panel jargon">
         <h2>Model feature importance</h2>
         <div class="sub" id="model-status">what the XGBoost ETA model is working off of (gain)</div>
         <div class="chartbox"><canvas id="importance"></canvas></div>
       </div>
-      <div class="panel">
+      <div class="panel jargon">
         <h2>Feature explorer</h2>
         <div class="sub">avg segment travel time by
           <select id="feature">

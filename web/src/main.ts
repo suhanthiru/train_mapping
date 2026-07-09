@@ -11,10 +11,22 @@ import type { PickingInfo } from "@deck.gl/core";
 import { distToLonLat, bearingAt, type Shape } from "./geo.ts";
 import { trainCarMesh, busMesh } from "./mesh.ts";
 
+// Same-origin by default — this bundle is served BY the backend on :8080, so
+// same-origin naturally follows the page wherever it's reached from (direct
+// :8080, or a TLS-terminating reverse proxy on 80/443 with no port at all).
+// Explicit :8080 is used ONLY under `vite dev` (:5173), which has no dev proxy
+// configured, so the API has to be reached across ports there.
 const HOST = location.hostname || "localhost";
-const HTTP = `http://${HOST}:8080`;
-const WS = `ws://${HOST}:8080`;
-const ANALYTICS = `http://${HOST}:8090`; // Go streaming-analytics service (separate microservice)
+const onViteDev = location.port === "5173";
+const HTTP_PROTO = location.protocol === "https:" ? "https:" : "http:";
+const WS_PROTO = location.protocol === "https:" ? "wss:" : "ws:";
+const HTTP = onViteDev ? `${HTTP_PROTO}//${HOST}:8080` : `${HTTP_PROTO}//${location.host}`;
+const WS = onViteDev ? `${WS_PROTO}//${HOST}:8080` : `${WS_PROTO}//${location.host}`;
+// Go streaming-analytics service (separate microservice, :8090) is never
+// same-origin with anything — reachable only where its port is exposed
+// (local dev, or a VPS with :8090 open). Behind a TLS proxy that doesn't
+// forward it, this degrades gracefully: the anomalies panel just shows nothing.
+const ANALYTICS = `${HTTP_PROTO}//${HOST}:8090`;
 const SPEED_BOOST = 1.0; // real rate — no overshoot, so no snap-back/reversing
 
 interface RouteInfo { id: string; color: string; textColor: string; shortName: string }
@@ -26,7 +38,6 @@ interface Vehicle {
   color: [number, number, number];
   route: string; nextStopName?: string;
   position: [number, number, number]; angle: number;
-  occStatus?: string; occPct?: number;
   elevation: Elevation;
   uncertainty?: number; // √variance (m) from the Kalman sidecar; drives the K halo
 }
@@ -49,32 +60,13 @@ const ELEVATION_Z: Record<Elevation, number> = {
 let shapes: Record<string, Shape> = {};
 let routes: Record<string, RouteInfo> = {};
 const vehicles = new Map<string, Vehicle>();
-interface Bus { id: string; lon: number; lat: number; tLon: number; tLat: number; heading: number; speed: number; route: string; color: [number, number, number]; occStatus?: string; occPct?: number; }
+interface Bus { id: string; lon: number; lat: number; tLon: number; tLat: number; heading: number; speed: number; route: string; color: [number, number, number]; }
 
-// Friendly label + color for a GTFS-rt occupancy status. Green (empty) ->
-// amber (seats) -> red (crowded). occPct is usually 0/placeholder in these
-// feeds, so lead with the status; only show % when it's non-trivial.
-const OCC_UI: Record<string, { label: string; color: string }> = {
-  EMPTY: { label: "Empty", color: "#4fd67a" },
-  MANY_SEATS_AVAILABLE: { label: "Many seats", color: "#7ed957" },
-  FEW_SEATS_AVAILABLE: { label: "Few seats", color: "#f0c040" },
-  STANDING_ROOM_ONLY: { label: "Standing room only", color: "#f0902f" },
-  CRUSHED_STANDING_ROOM_ONLY: { label: "Crushed — standing only", color: "#f0562f" },
-  FULL: { label: "Full", color: "#e53950" },
-  NOT_ACCEPTING_PASSENGERS: { label: "Not boarding", color: "#9aa7b0" },
-  NOT_BOARDABLE: { label: "Not boarding", color: "#9aa7b0" },
-};
-// PAUSED: NYC's MTA feed sends occupancy as a placeholder (EMPTY for 100% of
-// trains — no passenger-counting hardware), so showing it is misleading.
-// Flip to true once a real crowding source (e.g. station ridership) is wired.
-const OCCUPANCY_ENABLED = false;
-function occupancyHTML(status?: string, pct?: number): string {
-  if (!OCCUPANCY_ENABLED || !status) return "";
-  const ui = OCC_UI[status] ?? { label: status.toLowerCase().replace(/_/g, " "), color: "#9aa7b0" };
-  const pctStr = pct && pct > 0 ? ` · ${Math.round(pct)}%` : "";
-  return `<div class="occ"><span class="occ-dot" style="background:${ui.color}"></span>` +
-    `<span>${ui.label}${pctStr}</span></div>`;
-}
+// NOTE: GTFS-rt occupancy was REMOVED (not merely hidden) — NYC's MTA feed sends
+// it as a placeholder (EMPTY for 100% of trains; no passenger-counting hardware),
+// so it was dead weight end to end. The real crowding signal is station-hourly
+// ridership (analytics-py/mta_ridership.py), a model feature rather than a per-
+// train UI badge.
 interface AnomalySummary {
   routeId: string; direction: string; mode: string; color: string;
   gapSeconds: number; zscore: number; kind: "bunching" | "gap"; why: string;
@@ -215,7 +207,6 @@ async function showJourney(v: Vehicle) {
       `<span class="close" onclick="document.getElementById('journey').style.display='none'">✕</span>` +
       `<div class="j-head"><span class="route-badge" style="background:${data.color}">${data.route}</span>` +
       `<div><b>${data.route} train</b>${data.dest ? `<br><span class="j-dest">toward ${data.dest}</span>` : ""}</div></div>` +
-      occupancyHTML(v.occStatus, v.occPct) +
       `<div class="j-stops">${rows || '<span style="opacity:.6">no upcoming stops in feed</span>'}</div>`;
   } catch {
     journeyEl.innerHTML = `<span class="close" onclick="document.getElementById('journey').style.display='none'">✕</span>` +
@@ -230,8 +221,7 @@ function showBusInfo(b: Bus) {
   journeyEl.innerHTML =
     `<span class="close" onclick="document.getElementById('journey').style.display='none'">✕</span>` +
     `<div class="j-head"><span class="route-badge" style="background:#F0A830">${b.route}</span>` +
-    `<div><b>${b.route} bus</b><br><span class="j-dest">${(b.speed * 2.237).toFixed(0)} mph</span></div></div>` +
-    occupancyHTML(b.occStatus, b.occPct); // occupancy paused (placeholder feed data) — see occupancyHTML
+    `<div><b>${b.route} bus</b><br><span class="j-dest">${(b.speed * 2.237).toFixed(0)} mph</span></div></div>`;
 }
 
 function onClick(info: PickingInfo) {
@@ -498,11 +488,10 @@ function applyState(list: any[]) {
         // along heading — that cuts across curves and drifts off the street
         eb.tLon = s.pos[0]; eb.tLat = s.pos[1];
         eb.speed = s.speed ?? eb.speed;
-        eb.occStatus = s.occStatus; eb.occPct = s.occPct;
         if (Math.abs(eb.tLon - eb.lon) > 0.02 || Math.abs(eb.tLat - eb.lat) > 0.02) { eb.lon = eb.tLon; eb.lat = eb.tLat; } // snap big jumps
       } else {
         // initial heading: convert feed bearing via the user-calibrated mode (compass = 90 - b)
-        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], tLon: s.pos[0], tLat: s.pos[1], heading: ((90 - (s.bearing ?? 0)) + 360) % 360, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color), occStatus: s.occStatus, occPct: s.occPct });
+        buses.set(s.id, { id: s.id, lon: s.pos[0], lat: s.pos[1], tLon: s.pos[0], tLat: s.pos[1], heading: ((90 - (s.bearing ?? 0)) + 360) % 360, speed: s.speed ?? 7, route: s.route, color: hex2rgb(s.color) });
       }
       continue;
     }
@@ -511,7 +500,6 @@ function applyState(list: any[]) {
     const ex = vehicles.get(s.id);
     if (ex) {
       ex.route = s.route; ex.nextStopName = s.nextStopName;
-      ex.occStatus = s.occStatus; ex.occPct = s.occPct;
       ex.elevation = s.elevation ?? "underground"; // can change if shape resolution reroutes (express/local)
       ex.uncertainty = s.uncertainty;
       const drift = s.dist - ex.dist;
@@ -524,7 +512,6 @@ function applyState(list: any[]) {
         color: hex2rgb(s.color), route: s.route, nextStopName: s.nextStopName,
         position: [...distToLonLat(shapes[s.shapeId], s.dist), 0] as [number, number, number],
         angle: bearingAt(shapes[s.shapeId], s.dist),
-        occStatus: s.occStatus, occPct: s.occPct,
         elevation: s.elevation ?? "underground",
         uncertainty: s.uncertainty,
       });

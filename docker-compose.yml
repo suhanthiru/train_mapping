@@ -9,6 +9,15 @@ services:
   analytics-py:
     build: ./analytics-py
     ports: ["8091:8091"]
+    # Bind-mount ./data so the model reads the same ledger the backend writes and
+    # persists the trained model across restarts (MODEL_DIR). Without this the
+    # containerized retrain reads an empty DB and /predict 503s on every restart.
+    environment:
+      - LEDGER_DB=/data/ledger.db
+      - MODEL_DIR=/data/models
+      - GOLDENSET_DIR=/data/exports/goldenset
+    volumes:
+      - ./data:/data
 
   backend:
     build:

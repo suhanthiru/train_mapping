@@ -14,8 +14,9 @@ from datetime import datetime, timezone
 import polars as pl
 
 HERE = os.path.dirname(__file__)
-LEDGER = os.path.join(HERE, "..", "data", "ledger.db")
-OUTDIR = os.path.join(HERE, "..", "data", "exports", "goldenset")
+# Env-overridable to match the container's bind mounts (see docker-compose.yml).
+LEDGER = os.environ.get("LEDGER_DB", os.path.join(HERE, "..", "data", "ledger.db"))
+OUTDIR = os.environ.get("GOLDENSET_DIR", os.path.join(HERE, "..", "data", "exports", "goldenset"))
 
 
 def main():

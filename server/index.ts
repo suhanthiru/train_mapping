@@ -23,8 +23,12 @@ const POLL_MS = 30_000; // how often we hit the live feed
 const PUSH_MS = 4_000; // how often we re-interpolate + broadcast fresh positions
 const WEATHER_MS = 5 * 60_000; // how often we sample the weather severity scalar
 const ALERTS_MS = 2 * 60_000; // how often we snapshot active service alerts
-const ANALYTICS_PY = process.env.ANALYTICS_PY ?? "http://localhost:8091";
-const KALMAN_RS = process.env.KALMAN_RS ?? "http://localhost:8092";
+// 127.0.0.1, NOT localhost: on Windows, "localhost" resolves IPv6 ::1 first and
+// the services bind IPv4-only, so every fresh connection pays a ~2s fallback —
+// measured live pushing /predict-batch past its 5s abort on every tick (the
+// socket dies before keep-alive can amortize it). Docker overrides via env.
+const ANALYTICS_PY = process.env.ANALYTICS_PY ?? "http://127.0.0.1:8091";
+const KALMAN_RS = process.env.KALMAN_RS ?? "http://127.0.0.1:8092";
 const ROOT = process.cwd();
 const DATA_DIR = join(ROOT, "data");
 const WEB_DIST = join(ROOT, "web", "dist");
@@ -62,6 +66,17 @@ let lastBuses: VehicleState[] = [];
 let kalmanInFlight = false; // guard: never stack overlapping Kalman round-trips
 let lastWeatherScore = 0; // reused by modelPredictTick so it doesn't need its own DB/HTTP round-trip
 
+// Latest Kalman-derived hop state per trip (frac into current hop + speed +
+// congestion), refreshed every 4s push tick by logVehicleState. model-v2 reads
+// this so its "remaining time in the current hop" prediction uses the same
+// numbers the forward-only vehicle_log trained on — measure and serve from one
+// source, no re-derivation.
+interface HopState { fromStop: string; toStop: string; frac: number; speed: number; ahead: number; ts: number }
+const lastHopState = new Map<string, HopState>();
+let lastFeedOkTs = 0; // epoch s of the last successful feed poll (observability)
+// /api/prediction-accuracy memo (per source) — see the handler for why.
+const accCache = new Map<string, { at: number; body: string }>();
+
 // Poll the live feeds (slow): just refreshes raw predictions/GPS. Does NOT
 // call interp.update() — that would silently advance the same continuity
 // state pushTick's clamp depends on, letting stacked "invisible" advances
@@ -73,6 +88,7 @@ async function fetchTick() {
     const [raws, buses] = await Promise.all([fetchNycVehicles(), fetchNycBuses()]);
     lastRaws = raws;
     lastBuses = buses;
+    lastFeedOkTs = Math.floor(Date.now() / 1000); // observability: feed freshness
     console.log(`[server] feed: ${lastRaws.length} trains + ${lastBuses.length} buses -> ${wss.clients.size} clients`);
     // Prediction ledger (bitemporal): log the feed's evolving ETAs + ground
     // truth on the 30s poll grain. Isolated in try/catch so a ledger hiccup
@@ -192,8 +208,88 @@ async function modelPredictTick(raws: RawVehicle[]): Promise<void> {
       }
     }
     ledger.recordModelPredictions(rows);
+
+    // ---- model-v2 (the late-bias fix): the v1 chain above adds the FULL
+    // duration of the hop the train is already inside — a train 70% through a
+    // 120s hop still gets all 120s, so every downstream arrival lands ~84s
+    // late (measured: 85-130s late bias at short leads). v2 asks the
+    // remaining-time model "given frac_hop/speed/congestion, how many seconds
+    // REMAIN in the current hop?", then chains v1's full durations for the
+    // not-yet-started hops. Both sources log side by side (source column) so
+    // accuracyByLeadTime grades the A/B with zero backtest changes. ----
+    await modelV2Tick(now, hour, dow, vehHops, byId);
   } catch (e) {
     console.error("[server] model prediction skipped:", (e as Error).message);
+  }
+}
+
+interface VehHopsT { tripId: string; routeId: string; feedTimestamp: number; hopIds: string[]; targetStops: string[] }
+
+async function modelV2Tick(
+  now: number, hour: number, dow: number,
+  vehHops: VehHopsT[], v1ById: Map<string, number>
+): Promise<void> {
+  try {
+    // One remaining-time request per vehicle whose live hop state matches the
+    // hop we're chaining from (guards against stale/reroute mismatches). No
+    // match -> no v2 row for that vehicle: honest gaps beat fabricated ones.
+    interface RemReq {
+      id: string; route_id: string; from_stop: string; to_stop: string;
+      hour: number; dow: number; weather_score: number; distance_m: number;
+      elevation: string; frac_hop: number; kalman_speed: number; trains_ahead: number;
+    }
+    const reqs: RemReq[] = [];
+    const eligible: VehHopsT[] = [];
+    for (const veh of vehHops) {
+      const hs = lastHopState.get(veh.tripId);
+      if (!hs || now - hs.ts > 30) continue; // no fresh Kalman hop state
+      if (hs.toStop !== veh.targetStops[0]) continue; // hop mismatch (reroute/lag)
+      const pf = stopPos[hs.fromStop];
+      const pt = stopPos[hs.toStop];
+      reqs.push({
+        id: veh.tripId, route_id: veh.routeId,
+        from_stop: hs.fromStop, to_stop: hs.toStop, hour, dow,
+        weather_score: lastWeatherScore,
+        distance_m: pf && pt ? Math.round(haversine(pf, pt)) : 0,
+        elevation: stopElev[hs.toStop] ?? stopElev[hs.fromStop] ?? "underground",
+        frac_hop: hs.frac, kalman_speed: hs.speed, trains_ahead: hs.ahead,
+      });
+      eligible.push(veh);
+    }
+    if (!reqs.length) return;
+
+    const r = await fetch(`${ANALYTICS_PY}/predict-remaining`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(reqs),
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!r.ok) return; // v2 not trained yet (needs vehicle_log history) — quiet skip
+    const rem = (await r.json()) as { id: string; remaining_sec: number }[];
+    const remById = new Map(rem.map((p) => [p.id, p.remaining_sec]));
+
+    const rows: { tripId: string; stopId: string; routeId: string; predArrival: number; observedAt: number }[] = [];
+    for (const veh of eligible) {
+      const r0 = remById.get(veh.tripId);
+      if (r0 == null) continue;
+      let cumulative = Math.max(0, r0); // remaining time in the CURRENT hop
+      rows.push({
+        tripId: veh.tripId, stopId: veh.targetStops[0], routeId: veh.routeId,
+        predArrival: now + Math.round(cumulative), observedAt: veh.feedTimestamp,
+      });
+      for (let i = 1; i < veh.hopIds.length; i++) {
+        const d = v1ById.get(veh.hopIds[i]); // future hops: full durations (v1)
+        if (d == null) break;
+        cumulative += d;
+        rows.push({
+          tripId: veh.tripId, stopId: veh.targetStops[i], routeId: veh.routeId,
+          predArrival: now + Math.round(cumulative), observedAt: veh.feedTimestamp,
+        });
+      }
+    }
+    if (rows.length) ledger.recordModelPredictions(rows, "model-v2");
+  } catch (e) {
+    console.error("[server] model-v2 skipped:", (e as Error).message);
   }
 }
 
@@ -243,6 +339,10 @@ function logVehicleState(trains: VehicleState[], now: number): void {
         kalmanSpeed: t.speed,
         uncertainty: t.uncertainty ?? 0,
         trainsAhead: ahead,
+      });
+      lastHopState.set(t.id.replace(/^nyc:/, ""), {
+        fromStop: hop.fromStop, toStop: hop.toStop, frac: hop.frac,
+        speed: t.speed, ahead, ts: now,
       });
     }
     if (rows.length) ledger.recordVehicleLog(rows);
@@ -320,12 +420,21 @@ const server = createServer(async (req, res) => {
   }
 
   // Backtest read-out: feed-prediction accuracy (MAE + bias) vs. lead time.
+  // 60s memo: the dashboard polls this for 3 sources every 15s (Simple mode
+  // doubles that), and both accuracyByLeadTime and counts() are synchronous
+  // multi-hundred-ms scans on node:sqlite — without the memo they stack up
+  // and starve the event loop (observed live; see fixed_errors.md I8).
   if (url === "/api/prediction-accuracy") {
     const source = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("source") ?? "gtfs-rt";
-    const buckets = ledger.accuracyByLeadTime(source);
-    res.writeHead(200, { "Content-Type": "application/json" }).end(
-      JSON.stringify({ source, counts: ledger.counts(), buckets })
-    );
+    const nowMs = Date.now();
+    const hit = accCache.get(source);
+    if (hit && nowMs - hit.at < 60_000) {
+      res.writeHead(200, { "Content-Type": "application/json" }).end(hit.body);
+      return;
+    }
+    const body = JSON.stringify({ source, counts: ledger.counts(), buckets: ledger.accuracyByLeadTime(source) });
+    accCache.set(source, { at: nowMs, body });
+    res.writeHead(200, { "Content-Type": "application/json" }).end(body);
     return;
   }
 
@@ -334,6 +443,24 @@ const server = createServer(async (req, res) => {
     const source = new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("source") ?? "gtfs-rt";
     res.writeHead(200, { "Content-Type": "application/json" }).end(
       JSON.stringify({ source, points: ledger.accuracyTrend(source) })
+    );
+    return;
+  }
+  if (url === "/api/system-health") {
+    // Observability: everything you need to know the pipeline is alive, in one
+    // read — feed freshness, write rates, live counts. A silent stall shows up
+    // here in minutes instead of weeks.
+    const now = Math.floor(Date.now() / 1000);
+    res.writeHead(200, { "Content-Type": "application/json" }).end(
+      JSON.stringify({
+        now,
+        feedAgeSec: lastFeedOkTs ? now - lastFeedOkTs : null,
+        trains: lastRaws.length,
+        buses: lastBuses.length,
+        wsClients: wss.clients.size,
+        writeRates: ledger.writeRates(now),
+        counts: ledger.counts(),
+      })
     );
     return;
   }
@@ -438,7 +565,7 @@ server.listen(PORT, () => {
   setInterval(alertsTick, ALERTS_MS);
   // Accuracy snapshots (Phase 4): trend the backtest over time for the dashboard.
   const snap = () => {
-    try { ledger.recordAccuracySnapshot("gtfs-rt"); ledger.recordAccuracySnapshot("model-v1"); }
+    try { ledger.recordAccuracySnapshot("gtfs-rt"); ledger.recordAccuracySnapshot("model-v1"); ledger.recordAccuracySnapshot("model-v2"); }
     catch (e) { console.error("[server] accuracy snapshot failed:", (e as Error).message); }
   };
   snap();

@@ -1,0 +1,48 @@
+# Reverse proxy for the always-on host — TLS is automatic (Let's Encrypt),
+# no cert management needed. Copy this file to the VM, edit the two domains
+# below, then run: sudo caddy run --config Caddyfile
+#
+# Requires: DNS A records for both hosts pointing at the VM's public IP, and
+# ports 80 + 443 open (Caddy needs 80 for the ACME HTTP challenge).
+# Install Caddy (Ubuntu): https://caddyserver.com/docs/install#debian-ubuntu-raspbian
+#
+# These path prefixes match dashboard/app.js's proxy-mode branching exactly
+# (see the comment there) — don't rename one without the other.
+
+# Live 3D map + its own API/WebSocket, all served by the backend on :8080.
+# Single origin, so no path rewriting needed — web/src/main.ts already talks
+# same-origin (it derives HTTP/WS from location.host, not a hardcoded port).
+map.yourdomain.com {
+	reverse_proxy 127.0.0.1:8080
+}
+
+# Analytics dashboard. Serves its own static assets at :4174, and proxies the
+# three backend services it fetches from under path prefixes so everything
+# stays same-origin under one HTTPS cert (avoids mixed-content / insecure-WS
+# blocking that would otherwise break a cross-port fetch from an https: page).
+analytics.yourdomain.com {
+	handle_path /api-backend/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+	handle_path /api-kalman/* {
+		reverse_proxy 127.0.0.1:8092
+	}
+	handle_path /api-analytics/* {
+		reverse_proxy 127.0.0.1:8091
+	}
+	reverse_proxy 127.0.0.1:4174
+
+	# Uncomment to password-protect the dashboard (generate the hash with
+	# `caddy hash-password`, paste the output in place of REPLACE_ME):
+	# basicauth {
+	# 	admin REPLACE_ME
+	# }
+}
+
+# analytics-go (:8090, the streaming-anomaly-detection service) is fetched
+# directly by the map's browser JS (not proxied, not same-origin with
+# anything) — expose it only if you want the live anomalies panel to work
+# publicly; otherwise leave its port closed and the panel just shows nothing.
+# anomalies.yourdomain.com {
+# 	reverse_proxy 127.0.0.1:8090
+# }

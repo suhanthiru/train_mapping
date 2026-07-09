@@ -212,11 +212,6 @@ func main() {
 		log.Printf("[main] seeded %d baselines from %s", len(seeded), dbPath)
 	}
 
-	// On-change occupancy tracking: only write a row when a vehicle's
-	// occupancy actually changes (a compact state-transition time series,
-	// not a 500-rows-every-4s firehose).
-	lastOcc := map[string]string{}
-
 	// Enrich anomalies with weather/311 context + log new anomaly events (own
 	// slow timer, never blocks the hot WS path).
 	go func() {
@@ -247,25 +242,11 @@ func main() {
 	tick := 0
 	wsclient.Run(nodeWSURL, func(msg wsclient.StateMessage) {
 		busInputs := make([]stats.BusInput, 0, len(msg.Vehicles))
-		occRows := make([]persist.OccupancyRow, 0, 32)
 
 		for _, v := range msg.Vehicles {
 			p, ok := resolvePosition(v, geo)
 			if !ok {
 				continue
-			}
-
-			// Occupancy transition -> record.
-			if v.OccStatus != "" && lastOcc[v.ID] != v.OccStatus {
-				lastOcc[v.ID] = v.OccStatus
-				pct := 0.0
-				if v.OccPct != nil {
-					pct = *v.OccPct
-				}
-				occRows = append(occRows, persist.OccupancyRow{
-					Ts: msg.Ts, VehicleID: v.ID, Route: v.Route, Mode: v.Mode,
-					Status: v.OccStatus, Pct: pct, Lon: p[0], Lat: p[1],
-				})
 			}
 
 			if v.Mode == "bus" {
@@ -292,14 +273,10 @@ func main() {
 		headway.ObserveBuses(busInputs, msg.Ts)
 		// store's anomalies are updated by the enrich goroutine, not here.
 
-		if err := db.RecordOccupancy(occRows); err != nil {
-			log.Printf("[persist] occupancy: %v", err)
-		}
-
 		tick++
 		if tick%10 == 0 {
-			log.Printf("[tick] %d vehicles | occupancy transitions this tick: %d | headway keys: %d | flagged: %d",
-				len(msg.Vehicles), len(occRows), len(headway.Keys()), len(headway.CurrentAnomalies()))
+			log.Printf("[tick] %d vehicles | headway keys: %d | flagged: %d",
+				len(msg.Vehicles), len(headway.Keys()), len(headway.CurrentAnomalies()))
 		}
 	})
 }

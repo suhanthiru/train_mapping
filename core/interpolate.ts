@@ -273,8 +273,6 @@ export class Interpolator {
         nextStop: nextStopId,
         nextStopName: nextStopId ? this.s.stops[nextStopId]?.name : undefined,
         stale,
-        occStatus: v.occStatus,
-        occPct: v.occPct,
       });
     }
     return out;

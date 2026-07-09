@@ -11,6 +11,7 @@
     "preprocess:osm-layers": "tsx preprocess/fetch-osm-layers.ts",
     "preprocess:osm-match": "tsx preprocess/match-osm-elevation.ts",
     "report:accuracy": "tsx history/ledger-report.ts",
+    "report:backtest": "tsx history/backtest-report.ts",
     "export:graph": "tsx history/export.ts graph",
     "export:data": "tsx history/export.ts data",
     "export:all": "tsx history/export.ts all",

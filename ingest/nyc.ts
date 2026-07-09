@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { RawVehicle, Stop } from "../shared/types.ts";
-import { decodeOccupancy } from "../shared/occupancy.ts";
+import { validateRawVehicles } from "../shared/validate.ts";
 
 // The MTA splits the subway into feeds by line group. %2F = "/" (nyct/<feed>).
 const BASE = "https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2F";
@@ -37,7 +37,11 @@ function toNum(v: unknown): number | undefined {
 export async function fetchNycVehicles(): Promise<RawVehicle[]> {
   const results = await Promise.allSettled(
     FEEDS.map(async (f) => {
-      const res = await fetch(BASE + f);
+      // 8s cap: the only fetch in this codebase that lacked a timeout — a
+      // hung MTA connection (feed slow/unreachable) would otherwise pile up
+      // unresolved sockets and, empirically, stall the whole process (even
+      // unrelated same-process HTTP handlers stopped responding).
+      const res = await fetch(BASE + f, { signal: AbortSignal.timeout(8000) });
       if (!res.ok) throw new Error(`${f}: HTTP ${res.status}`);
       const bytes = new Uint8Array(await res.arrayBuffer());
       return GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(bytes);
@@ -122,15 +126,21 @@ export async function fetchNycVehicles(): Promise<RawVehicle[]> {
         v.currentStatus =
           ve.currentStatus != null ? statusMap[ve.currentStatus] : v.currentStatus;
         v.atStopId = ve.stopId ?? v.atStopId;
-        const occ = decodeOccupancy(ve);
-        v.occStatus = occ.occStatus ?? v.occStatus;
-        v.occPct = occ.occPct ?? v.occPct;
         out.set(tripId, v);
       }
     }
   }
 
-  return [...out.values()];
+  // Schema validation at the adapter boundary: drop malformed/implausible
+  // records before they can reach the ledger and poison training data.
+  const { vehicles, stats } = validateRawVehicles([...out.values()]);
+  if (stats.vehiclesDropped || stats.upcomingDropped) {
+    console.warn(
+      `[nyc-ingest] validation dropped ${stats.vehiclesDropped} vehicles, ` +
+      `${stats.upcomingDropped} upcoming entries:`, stats.reasons
+    );
+  }
+  return vehicles;
 }
 
 // --- standalone smoke test ---

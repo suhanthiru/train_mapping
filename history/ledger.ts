@@ -2,7 +2,7 @@
 // arrival predictions (with when-we-knew-them), the eventual ACTUAL arrivals
 // (ground truth), and city weather over time — the data foundation for an ETA
 // backtest (feed accuracy vs. lead time) and a later ETA model whose features
-// are occupancy + weather + time/route context. Separate DB from history.db so
+// are weather + time/route context. Separate DB from history.db so
 // it's fully additive. Uses Node 24's built-in node:sqlite (no native build).
 //
 // Grain: recording hooks the 30s feed poll (fetchTick), not the 4s pushTick —
@@ -53,8 +53,6 @@ export class PredictionLedger {
         route_id     TEXT,
         pred_arrival INTEGER NOT NULL,  -- valid time: predicted arrival (epoch s)
         observed_at  INTEGER NOT NULL,  -- transaction time: feed ts we saw it (epoch s)
-        occ_status   TEXT,
-        occ_pct      REAL,
         source       TEXT NOT NULL DEFAULT 'gtfs-rt'
       );
       CREATE INDEX IF NOT EXISTS idx_pred_key ON predictions(trip_id, stop_id, observed_at);
@@ -115,8 +113,6 @@ export class PredictionLedger {
         arrive_ts     INTEGER NOT NULL,
         travel_sec    INTEGER NOT NULL,
         weather_score INTEGER,
-        occ_status    TEXT,
-        occ_pct       REAL,
         hour          INTEGER,   -- local hour-of-day of arrival (0-23)
         dow           INTEGER,   -- local day-of-week of arrival (0=Sun)
         distance_m    REAL,      -- straight-line meters from_stop -> to_stop (Phase 2)
@@ -139,8 +135,8 @@ export class PredictionLedger {
       CREATE INDEX IF NOT EXISTS idx_accsnap_ts ON accuracy_snapshots(ts);
     `);
     this.insPred = this.db.prepare(
-      `INSERT INTO predictions (trip_id, stop_id, route_id, pred_arrival, observed_at, occ_status, occ_pct)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO predictions (trip_id, stop_id, route_id, pred_arrival, observed_at)
+       VALUES (?, ?, ?, ?, ?)`
     );
     this.insActual = this.db.prepare(
       `INSERT OR IGNORE INTO actuals (trip_id, stop_id, actual_arrival) VALUES (?, ?, ?)`
@@ -150,7 +146,7 @@ export class PredictionLedger {
     );
     this.insModelPred = this.db.prepare(
       `INSERT INTO predictions (trip_id, stop_id, route_id, pred_arrival, observed_at, source)
-       VALUES (?, ?, ?, ?, ?, 'model-v1')`
+       VALUES (?, ?, ?, ?, ?, ?)`
     );
     this.insAccSnap = this.db.prepare(
       `INSERT INTO accuracy_snapshots (ts, source, lead_label, n, mae_sec, bias_sec) VALUES (?, ?, ?, ?, ?, ?)`
@@ -178,15 +174,7 @@ export class PredictionLedger {
             continue; // unchanged belief — skip duplicate row
           }
           this.lastPred.set(key, u.time);
-          this.insPred.run(
-            v.tripId,
-            u.stopId,
-            v.routeId,
-            u.time,
-            v.feedTimestamp,
-            v.occStatus ?? null,
-            v.occPct ?? null
-          );
+          this.insPred.run(v.tripId, u.stopId, v.routeId, u.time, v.feedTimestamp);
         }
       }
       this.db.exec("COMMIT");
@@ -202,17 +190,19 @@ export class PredictionLedger {
    * grade them identically for a head-to-head backtest. Change-detected with a
    * separate key namespace so it can't collide with the feed's own tracking.
    */
-  recordModelPredictions(rows: { tripId: string; stopId: string; routeId: string; predArrival: number; observedAt: number }[]): void {
+  recordModelPredictions(rows: { tripId: string; stopId: string; routeId: string; predArrival: number; observedAt: number }[], source = "model-v1"): void {
     this.db.exec("BEGIN");
     try {
       for (const r of rows) {
-        const key = `model:${r.tripId}|${r.stopId}`;
+        // namespace the change-detection key by source so model-v1 and model-v2
+        // (or any future version) never collide in the dedup map
+        const key = `${source}:${r.tripId}|${r.stopId}`;
         const prev = this.lastPred.get(key);
         if (prev !== undefined && Math.abs(r.predArrival - prev) <= PRED_CHANGE_THRESHOLD_S) {
           continue; // unchanged belief — skip duplicate row
         }
         this.lastPred.set(key, r.predArrival);
-        this.insModelPred.run(r.tripId, r.stopId, r.routeId, r.predArrival, r.observedAt);
+        this.insModelPred.run(r.tripId, r.stopId, r.routeId, r.predArrival, r.observedAt, source);
       }
       this.db.exec("COMMIT");
     } catch (e) {
@@ -285,38 +275,53 @@ export class PredictionLedger {
    * The backtest: for every (trip, stop) with a known actual arrival, take each
    * earlier prediction, compute lead time (actual - observed_at) and error
    * (pred - actual), and aggregate MAE + signed bias into lead-time buckets.
+   *
+   * ROLLING WINDOW + SQL AGGREGATION (both load-bearing, learned the hard way):
+   * this used to `.all()` every graded row into JS — 8.6M objects for model-v1
+   * (~3 GB) on the SYNCHRONOUS node:sqlite handle, so each call blocked the
+   * event loop for seconds and the dashboard's 15s polling ×3 sources OOMed the
+   * process (observed live: 3 GB RSS within 20s of boot, HTTP unresponsive —
+   * exactly the "compounds silently" failure the incremental-backtest note
+   * predicted). Now SQLite aggregates in C and returns ≤5 rows, and the window
+   * keeps the scan on idx_pred_observed instead of the whole 30-day table.
+   * This makes the live metric "rolling recent accuracy" (default 6h) — the
+   * full-history version lives in `npm run report:backtest` (DuckDB, offline),
+   * which is the right tool for that question anyway.
    */
-  accuracyByLeadTime(source = "gtfs-rt"): LeadTimeBucket[] {
+  accuracyByLeadTime(source = "gtfs-rt", windowS = 6 * 3600): LeadTimeBucket[] {
+    const since = Math.floor(Date.now() / 1000) - windowS;
     const rows = this.db
       .prepare(
-        `SELECT
-           (a.actual_arrival - p.observed_at) AS lead,
-           (p.pred_arrival - a.actual_arrival) AS err
-         FROM predictions p
-         JOIN actuals a ON a.trip_id = p.trip_id AND a.stop_id = p.stop_id
-         WHERE p.source = ?
-           AND p.observed_at <= a.actual_arrival
-           AND (a.actual_arrival - p.observed_at) BETWEEN 0 AND 1800`
+        `SELECT CASE WHEN lead < 60 THEN '0-1 min'
+                     WHEN lead < 120 THEN '1-2 min'
+                     WHEN lead < 300 THEN '2-5 min'
+                     WHEN lead < 600 THEN '5-10 min'
+                     ELSE '10+ min' END AS leadLabel,
+                COUNT(*) AS n,
+                AVG(ABS(err)) AS maeSec,
+                AVG(err) AS biasSec
+         FROM (
+           SELECT (a.actual_arrival - p.observed_at) AS lead,
+                  (p.pred_arrival - a.actual_arrival) AS err
+           FROM predictions p
+           JOIN actuals a ON a.trip_id = p.trip_id AND a.stop_id = p.stop_id
+           WHERE p.observed_at >= ?
+             AND p.source = ?
+             AND p.observed_at <= a.actual_arrival
+             AND (a.actual_arrival - p.observed_at) BETWEEN 0 AND 1800
+         )
+         GROUP BY leadLabel`
       )
-      .all(source) as { lead: number; err: number }[];
+      .all(since, source) as { leadLabel: string; n: number; maeSec: number; biasSec: number }[];
 
-    const buckets: { label: string; lo: number; hi: number }[] = [
-      { label: "0-1 min", lo: 0, hi: 60 },
-      { label: "1-2 min", lo: 60, hi: 120 },
-      { label: "2-5 min", lo: 120, hi: 300 },
-      { label: "5-10 min", lo: 300, hi: 600 },
-      { label: "10+ min", lo: 600, hi: Infinity },
-    ];
-    return buckets.map((b) => {
-      const inB = rows.filter((r) => r.lead >= b.lo && r.lead < b.hi);
-      const n = inB.length;
-      const maeSec = n ? inB.reduce((s, r) => s + Math.abs(r.err), 0) / n : 0;
-      const biasSec = n ? inB.reduce((s, r) => s + r.err, 0) / n : 0;
+    const byLabel = new Map(rows.map((r) => [r.leadLabel, r]));
+    return ["0-1 min", "1-2 min", "2-5 min", "5-10 min", "10+ min"].map((label) => {
+      const r = byLabel.get(label);
       return {
-        leadLabel: b.label,
-        n,
-        maeSec: Math.round(maeSec),
-        biasSec: Math.round(biasSec),
+        leadLabel: label,
+        n: r?.n ?? 0,
+        maeSec: Math.round(r?.maeSec ?? 0),
+        biasSec: Math.round(r?.biasSec ?? 0),
       };
     });
   }
@@ -324,7 +329,7 @@ export class PredictionLedger {
   /**
    * (Re)materialize `segments` from `actuals`: pair each trip's consecutive
    * observed arrivals into (from_stop -> to_stop) hops with travel time,
-   * enriched with nearest weather + that trip/stop's occupancy + local hour/dow.
+   * enriched with nearest weather + local hour/dow.
    * Cheap full rebuild — call on a slow timer / on demand. Returns rows written.
    */
   buildSegments(stopPos?: Record<string, [number, number]>, stopElev?: Record<string, string>): number {
@@ -340,13 +345,10 @@ export class PredictionLedger {
     const wxStmt = this.db.prepare(
       "SELECT weather_score FROM conditions WHERE ts <= ? ORDER BY ts DESC LIMIT 1"
     );
-    const occStmt = this.db.prepare(
-      "SELECT occ_status, occ_pct FROM predictions WHERE trip_id = ? AND stop_id = ? ORDER BY observed_at DESC LIMIT 1"
-    );
     const ins = this.db.prepare(
       `INSERT INTO segments
-         (trip_id, route_id, from_stop, to_stop, depart_ts, arrive_ts, travel_sec, weather_score, occ_status, occ_pct, hour, dow, distance_m, elevation)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+         (trip_id, route_id, from_stop, to_stop, depart_ts, arrive_ts, travel_sec, weather_score, hour, dow, distance_m, elevation)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     );
 
     this.db.exec("BEGIN");
@@ -362,7 +364,6 @@ export class PredictionLedger {
         // NYC trip_id like "015200_1..N10R" -> route "1"
         const routeId = b.trip_id.split("_")[1]?.split("..")[0] ?? null;
         const wx = wxStmt.get(b.actual_arrival) as { weather_score: number } | undefined;
-        const occ = occStmt.get(b.trip_id, b.stop_id) as { occ_status: string; occ_pct: number } | undefined;
         const d = new Date(b.actual_arrival * 1000); // local tz (assumed ET on the host)
         const pf = stopPos?.[a.stop_id];
         const pt = stopPos?.[b.stop_id];
@@ -372,7 +373,6 @@ export class PredictionLedger {
           b.trip_id, routeId, a.stop_id, b.stop_id,
           a.actual_arrival, b.actual_arrival, travel,
           wx?.weather_score ?? null,
-          occ?.occ_status ?? null, occ?.occ_pct ?? null,
           d.getHours(), d.getDay(), distance, elevation
         );
         n++;
@@ -399,6 +399,17 @@ export class PredictionLedger {
     // forget stale change-detection keys so the maps don't grow unbounded
     for (const [k, t] of this.lastPred) if (t < cutoff) this.lastPred.delete(k);
     return removed;
+  }
+
+  /** Rows written in the trailing hour — observability: is data still flowing? */
+  writeRates(now = Math.floor(Date.now() / 1000)): { predictionsPerHour: number; actualsPerHour: number; vehicleLogPerHour: number } {
+    const since = now - 3600;
+    const one = (sql: string) => Number((this.db.prepare(sql).get(since) as { c: number }).c);
+    return {
+      predictionsPerHour: one("SELECT COUNT(*) AS c FROM predictions WHERE observed_at > ?"),
+      actualsPerHour: one("SELECT COUNT(*) AS c FROM actuals WHERE actual_arrival > ?"),
+      vehicleLogPerHour: one("SELECT COUNT(*) AS c FROM vehicle_log WHERE ts > ?"),
+    };
   }
 
   /** Row counts for quick verification / status. */
@@ -464,7 +475,7 @@ export class PredictionLedger {
     return {
       segments: this.db
         .prepare(
-          `SELECT from_stop, to_stop, travel_sec, weather_score, occ_status, hour, dow, arrive_ts
+          `SELECT from_stop, to_stop, travel_sec, weather_score, hour, dow, arrive_ts
            FROM segments WHERE trip_id = ? ORDER BY arrive_ts`
         )
         .all(tripId) as any[],

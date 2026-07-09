@@ -29,8 +29,6 @@ type Vehicle struct {
 	Elevation string     `json:"elevation"`
 	NextStop  *string    `json:"nextStop,omitempty"`
 	Stale     *bool      `json:"stale,omitempty"`
-	OccStatus string     `json:"occStatus,omitempty"`
-	OccPct    *float64   `json:"occPct,omitempty"`
 }
 
 // StateMessage mirrors the {type, city, ts, vehicles} shape broadcast by

@@ -1,8 +1,19 @@
 // Analytics dashboard (roadmap Phase 4). Reads the live services and renders
 // Chart.js panels. Decoupled from the 3D map — charts, not GPU.
-const BACKEND = "http://localhost:8080";
-const KALMAN = "http://localhost:8092";
-const ANALYTICS = "http://localhost:8091";
+// Two deployment modes, distinguished by port (the dashboard's own dev/direct
+// port is always 4174 — see dashboard/serve.mjs):
+//  - direct-port (local dev, or a VPS with all ports opened, no TLS): each
+//    service is reached on the page's own host at its own explicit port.
+//  - behind a TLS proxy (Caddy/nginx on 80/443, no port in the URL): explicit
+//    cross-port fetches would be mixed-content-blocked, so instead we use
+//    same-origin path prefixes that infra/Caddyfile + infra/nginx.conf proxy
+//    through to each backend (see those files for the matching routes).
+const H = location.hostname || "localhost";
+const PROTO = location.protocol === "file:" ? "http:" : location.protocol;
+const directPort = location.port === "4174" || location.protocol === "file:";
+const BACKEND = directPort ? `${PROTO}//${H}:8080` : `${location.origin}/api-backend`;
+const KALMAN = directPort ? `${PROTO}//${H}:8092` : `${location.origin}/api-kalman`;
+const ANALYTICS = directPort ? `${PROTO}//${H}:8091` : `${location.origin}/api-analytics`;
 
 const AX = "#8b98a5", GRID = "#1f2937", ACCENT = "#3FD8FF";
 Chart.defaults.color = AX;
@@ -29,7 +40,116 @@ function cards(el, items) {
     .join("");
 }
 
+// "127" -> "2 minutes 7 seconds", "42" -> "42 seconds" — used by Simple mode
+// so every number reads as a duration a non-technical reader can picture.
+function fmtDuration(sec) {
+  const s = Math.round(Math.abs(sec));
+  if (s < 60) return `${s} second${s === 1 ? "" : "s"}`;
+  const m = Math.floor(s / 60), r = s % 60;
+  return r
+    ? `${m} minute${m === 1 ? "" : "s"} ${r} second${r === 1 ? "" : "s"}`
+    : `${m} minute${m === 1 ? "" : "s"}`;
+}
+const isSimple = () => document.body.classList.contains("simple");
+
+// ---- Simple mode: one plain-English summary panel, computed from the same
+// endpoints the technical panels already use, just spoken as sentences
+// instead of charts. "MAE" becomes "beats/behind the MTA by N minutes". ----
+async function loadPlainSummary() {
+  const el = document.getElementById("plain-content");
+  try {
+    const [feed, v1, v2, health, recent] = await Promise.all([
+      getJSON(`${BACKEND}/api/prediction-accuracy?source=gtfs-rt`),
+      getJSON(`${BACKEND}/api/prediction-accuracy?source=model-v1`),
+      getJSON(`${BACKEND}/api/prediction-accuracy?source=model-v2`).catch(() => ({ buckets: [] })),
+      getJSON(`${BACKEND}/api/system-health`).catch(() => null),
+      getJSON(`${BACKEND}/api/recent-arrivals`).catch(() => ({ rows: [] })),
+    ]);
+    // n-weighted average MAE/bias across graded lead-time buckets — same math
+    // as loadTrend's "overall" reduction, just named for a lay reader here.
+    const overall = (d) => {
+      const b = (d.buckets || []).filter((x) => x.n > 0);
+      const n = b.reduce((s, x) => s + x.n, 0);
+      if (!n) return null;
+      return { n, mae: b.reduce((s, x) => s + x.maeSec * x.n, 0) / n };
+    };
+    const F = overall(feed), V1 = overall(v1), V2 = overall(v2);
+    const useV2 = V2 && V2.n >= 20; // enough graded predictions to be more than noise
+    const ours = useV2 ? V2 : V1;
+    const oursLabel = useV2 ? "our newest prediction system" : "our prediction system";
+
+    const cards = [];
+
+    // 1. Headline: do we beat the MTA's own estimate, and by how much?
+    if (F && ours) {
+      const diff = F.mae - ours.mae; // positive = we're more accurate (lower avg error)
+      if (Math.abs(diff) < 2) {
+        cards.push(`<div class="plain-card"><span class="plain-emoji">🤝</span>${oursLabel} is about as accurate as the MTA's own estimate right now — both are typically off by around <b>${fmtDuration(ours.mae)}</b>.</div>`);
+      } else if (diff > 0) {
+        cards.push(`<div class="plain-card plain-good"><span class="plain-emoji">🎉</span>${oursLabel} beats the MTA's official estimate by <b>${fmtDuration(diff)}</b> on average. The MTA is typically off by ${fmtDuration(F.mae)}; ours is off by ${fmtDuration(ours.mae)}.</div>`);
+      } else {
+        cards.push(`<div class="plain-card plain-bad"><span class="plain-emoji">📉</span>The MTA's own estimate is currently more accurate than ${oursLabel}, by <b>${fmtDuration(-diff)}</b>. We're off by ${fmtDuration(ours.mae)} on average; the MTA is off by ${fmtDuration(F.mae)}.</div>`);
+      }
+    } else {
+      cards.push(`<div class="plain-card"><span class="plain-emoji">⏳</span>Still collecting enough real arrivals to compare our predictions to the MTA's.</div>`);
+    }
+
+    // 2. The v1-vs-v2 story, only once v2 has enough real data to say something.
+    if (V1 && useV2 && V1.mae - V2.mae > 2) {
+      cards.push(`<div class="plain-card"><span class="plain-emoji">🛠️</span>We recently fixed a bug in our prediction system. The <b>new version</b> is <b>${fmtDuration(V1.mae - V2.mae)}</b> more accurate on average than the old one.</div>`);
+    }
+
+    // 3. Is the whole thing even running right now?
+    if (health) {
+      const age = health.feedAgeSec;
+      if (age != null && age < 90) {
+        cards.push(`<div class="plain-card"><span class="plain-emoji">🟢</span>Everything is running live — we got fresh train positions <b>${age} second${age === 1 ? "" : "s"} ago</b>, tracking <b>${health.trains}</b> trains right now.</div>`);
+      } else {
+        cards.push(`<div class="plain-card plain-bad"><span class="plain-emoji">🔴</span>We haven't heard from the live train feed in a while — something may be down.</div>`);
+      }
+    }
+
+    // 4. A concrete scoreboard over real, recent arrivals — the "receipts".
+    const graded = (recent.rows || []).filter((r) => r.feed && r.model);
+    if (graded.length) {
+      const ourWins = graded.filter((r) => Math.abs(r.model.errSec) <= Math.abs(r.feed.errSec)).length;
+      cards.push(`<div class="plain-card"><span class="plain-emoji">🏆</span>Looking at the last <b>${graded.length}</b> trains that actually arrived, our prediction was closer to the truth <b>${ourWins} out of ${graded.length}</b> times (the MTA won the rest).</div>`);
+    }
+
+    el.innerHTML = cards.join("");
+  } catch {
+    el.innerHTML = '<div class="empty">couldn\'t load a plain summary right now — the backend may be down</div>';
+  }
+}
+
 // ---- system panels ----
+async function loadSysHealth() {
+  const el = document.getElementById("syshealth");
+  try {
+    const [h, py] = await Promise.all([
+      getJSON(`${BACKEND}/api/system-health`),
+      getJSON(`${ANALYTICS}/health`).catch(() => null),
+    ]);
+    const age = h.feedAgeSec;
+    const feedCol = age == null ? "var(--muted)" : age < 90 ? "#7ed957" : age < 300 ? "#f0c040" : "#e53950";
+    const w = h.writeRates || {};
+    const items = [
+      { k: "feed age", v: `<span style="color:${feedCol}">${age == null ? "—" : age + "s"}</span>` },
+      { k: "trains / buses", v: `${h.trains} / ${h.buses}` },
+      { k: "preds/hr", v: (w.predictionsPerHour ?? 0).toLocaleString() },
+      { k: "actuals/hr", v: (w.actualsPerHour ?? 0).toLocaleString() },
+      { k: "vehicle log/hr", v: (w.vehicleLogPerHour ?? 0).toLocaleString() },
+      { k: "model v1 / v2", v: py ? `${py.model_loaded ? "✓" : "✗"} / ${py.model_v2_loaded ? "✓" : "✗"}` : "py down" },
+      { k: "ridership keys", v: py?.ridership ? (py.ridership.profile_keys ?? 0).toLocaleString() : "—" },
+    ];
+    el.innerHTML = items
+      .map((i) => `<div class="card"><div class="k">${i.k}</div><div class="v">${i.v}</div></div>`)
+      .join("");
+  } catch {
+    el.innerHTML = '<div class="empty">backend not reachable — the pipeline is DOWN (this panel existing is the point)</div>';
+  }
+}
+
 async function loadCounts() {
   const d = await getJSON(`${BACKEND}/api/prediction-accuracy`);
   const c = d.counts || {};
@@ -69,54 +189,57 @@ async function loadAccuracy(d) {
 // way each source tends to be wrong — late = positive, early = negative).
 async function loadHeadToHead() {
   const ALL_LABELS = ["0-1 min", "1-2 min", "2-5 min", "5-10 min", "10+ min"];
-  let feed, model;
+  let feed, model, model2;
   try {
-    [feed, model] = await Promise.all([
+    [feed, model, model2] = await Promise.all([
       getJSON(`${BACKEND}/api/prediction-accuracy?source=gtfs-rt`),
       getJSON(`${BACKEND}/api/prediction-accuracy?source=model-v1`),
+      getJSON(`${BACKEND}/api/prediction-accuracy?source=model-v2`).catch(() => ({ buckets: [] })),
     ]);
   } catch {
     document.getElementById("h2h-cards").innerHTML = '<div class="empty">backend not reachable</div>';
     return;
   }
   const byLabel = (buckets) => Object.fromEntries((buckets || []).map((b) => [b.leadLabel, b]));
-  const fb = byLabel(feed.buckets), mb = byLabel(model.buckets);
-  const modelN = model.buckets?.reduce((s, b) => s + b.n, 0) ?? 0;
-  const feedN = feed.buckets?.reduce((s, b) => s + b.n, 0) ?? 0;
+  const fb = byLabel(feed.buckets), mb = byLabel(model.buckets), m2b = byLabel(model2.buckets);
+  const sum = (d) => d.buckets?.reduce((s, b) => s + b.n, 0) ?? 0;
+  const feedN = sum(feed), modelN = sum(model), model2N = sum(model2);
 
   cards(document.getElementById("h2h-cards"), [
-    { k: "feed graded predictions", v: feedN.toLocaleString() },
-    { k: "model graded predictions", v: modelN.toLocaleString() },
-    { k: "model status", v: modelN > 0 ? "collecting" : "no data yet" },
+    { k: "feed graded", v: feedN.toLocaleString() },
+    { k: "model-v1 graded", v: modelN.toLocaleString() },
+    { k: "model-v2 graded", v: model2N > 0 ? model2N.toLocaleString() : "collecting…" },
   ]);
 
-  if (modelN === 0) {
+  if (modelN === 0 && model2N === 0) {
     charts.h2h?.destroy(); charts["h2h-bias"]?.destroy();
-    document.getElementById("h2h").parentElement.innerHTML = '<div class="empty">model-v1 predictions not graded yet — the model needs to log predictions and then trains need to actually arrive (a few minutes)</div>';
+    document.getElementById("h2h").parentElement.innerHTML = '<div class="empty">model predictions not graded yet — the models need to log predictions and then trains need to actually arrive (a few minutes)</div>';
     return;
   }
 
-  const labels = ALL_LABELS.filter((l) => (fb[l]?.n ?? 0) > 0 || (mb[l]?.n ?? 0) > 0);
+  const V2 = "#7ed957"; // green: the late-bias fix — watch its 0-2min bias vs v1's
+  const labels = ALL_LABELS.filter((l) => (fb[l]?.n ?? 0) > 0 || (mb[l]?.n ?? 0) > 0 || (m2b[l]?.n ?? 0) > 0);
+  const ds = (map, key) => labels.map((l) => map[l]?.[key] ?? null);
+  const maeSets = [
+    { label: "feed (gtfs-rt) MAE", data: ds(fb, "maeSec"), backgroundColor: ACCENT, borderRadius: 4 },
+    { label: "model-v1 MAE", data: ds(mb, "maeSec"), backgroundColor: "#f0902f", borderRadius: 4 },
+  ];
+  const biasSets = [
+    { label: "feed bias (+ = late)", data: ds(fb, "biasSec"), backgroundColor: ACCENT, borderRadius: 4 },
+    { label: "v1 bias (+ = late)", data: ds(mb, "biasSec"), backgroundColor: "#f0902f", borderRadius: 4 },
+  ];
+  if (model2N > 0) {
+    maeSets.push({ label: "model-v2 MAE (frac_hop)", data: ds(m2b, "maeSec"), backgroundColor: V2, borderRadius: 4 });
+    biasSets.push({ label: "v2 bias (+ = late)", data: ds(m2b, "biasSec"), backgroundColor: V2, borderRadius: 4 });
+  }
   draw("h2h", {
     type: "bar",
-    data: {
-      labels,
-      datasets: [
-        { label: "feed (gtfs-rt) MAE", data: labels.map((l) => fb[l]?.maeSec ?? null), backgroundColor: ACCENT, borderRadius: 4 },
-        { label: "model (model-v1) MAE", data: labels.map((l) => mb[l]?.maeSec ?? null), backgroundColor: "#f0902f", borderRadius: 4 },
-      ],
-    },
+    data: { labels, datasets: maeSets },
     options: { responsive: true, maintainAspectRatio: false, scales: axes("MAE (s)") },
   });
   draw("h2h-bias", {
     type: "bar",
-    data: {
-      labels,
-      datasets: [
-        { label: "feed bias (+ = late)", data: labels.map((l) => fb[l]?.biasSec ?? null), backgroundColor: ACCENT, borderRadius: 4 },
-        { label: "model bias (+ = late)", data: labels.map((l) => mb[l]?.biasSec ?? null), backgroundColor: "#f0902f", borderRadius: 4 },
-      ],
-    },
+    data: { labels, datasets: biasSets },
     options: { responsive: true, maintainAspectRatio: false, scales: axes("bias (s)") },
   });
 }
@@ -152,8 +275,9 @@ async function loadImportance() {
   try {
     const h = await getJSON(`${ANALYTICS}/health`);
     const when = h.last_trained ? new Date(h.last_trained * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "startup";
+    const v2 = h.model_v2_loaded ? ` · v2: ${(h.v2_n_train ?? 0).toLocaleString()} mid-hop samples, MAE ${h.v2_mae ?? "—"}s` : " · v2: not trained yet";
     document.getElementById("model-status").textContent =
-      `model-v1 · trained on ${(h.n_train ?? 0).toLocaleString()} segments · in-sample MAE ${h.mae ?? "—"}s · last retrained ${when}`;
+      `v1: ${(h.n_train ?? 0).toLocaleString()} segments, MAE ${h.mae ?? "—"}s${v2} · last retrained ${when}`;
   } catch { /* leave default */ }
   try {
     const d = await getJSON(`${ANALYTICS}/feature-importance`);
@@ -188,16 +312,31 @@ async function loadRecentArrivals() {
   catch { document.getElementById("recent-table").innerHTML = '<div class="empty">backend not reachable</div>'; return; }
   const rows = d.rows || [];
   if (!rows.length) { document.getElementById("recent-table").innerHTML = '<div class="empty">no graded arrivals yet</div>'; return; }
+  const simple = isSimple();
+  const titleEl = document.getElementById("recent-title"), subEl = document.getElementById("recent-sub");
+  if (titleEl) titleEl.textContent = simple ? "Recent arrivals — who guessed better?" : "Recent arrivals — estimated ETA vs. actual (ATA)";
+  if (subEl) subEl.textContent = simple
+    ? "the last 30 trains that actually arrived, and how far off each guess was"
+    : "the last 30 stops trains actually reached · each source's final prediction vs. what happened (Δ = predicted − actual, + is late)";
   const fmtT = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  const cell = (s) => (s ? `${s.errSec >= 0 ? "+" : ""}${s.errSec}s` : "–");
+  const cell = (s) => {
+    if (!s) return "–";
+    if (!simple) return `${s.errSec >= 0 ? "+" : ""}${s.errSec}s`;
+    if (Math.abs(s.errSec) < 5) return "on time";
+    return `${fmtDuration(s.errSec)} ${s.errSec >= 0 ? "late" : "early"}`;
+  };
   const closer = (r) => {
     if (!r.feed || !r.model) return "";
     const winner = Math.abs(r.feed.errSec) <= Math.abs(r.model.errSec) ? "feed" : "model";
     const col = winner === "feed" ? "#3FD8FF" : "#f0902f";
-    return `<span style="color:${col}">${winner}</span>`;
+    const label = simple ? (winner === "feed" ? "MTA" : "Us") : winner;
+    return `<span style="color:${col}">${label}</span>`;
   };
+  const heads = simple
+    ? ["arrived at", "route", "station", "MTA's guess", "our guess", "closer"]
+    : ["ATA", "route", "station", "feed Δ", "model Δ", "closer"];
   document.getElementById("recent-table").innerHTML =
-    `<table><thead><tr><th>ATA</th><th>route</th><th>station</th><th>feed Δ</th><th>model Δ</th><th>closer</th></tr></thead><tbody>` +
+    `<table><thead><tr>${heads.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>` +
     rows.map((r) => `<tr>
       <td>${fmtT(r.actualArrival)}</td>
       <td><span class="route-badge" style="background:#1f2937">${r.route}</span></td>
@@ -244,10 +383,22 @@ document.getElementById("mode-train").onclick = () => setMode("train");
 document.getElementById("feature").onchange = loadFeature;
 document.getElementById("loadtrip").onclick = loadTrip;
 
+// Simple mode: one button reframes the whole page for a non-technical reader
+// — swaps in a plain-English summary, hides every chart/jargon panel (marked
+// .jargon), and forces out of the technical Per-train view.
+function setPlainMode(on) {
+  document.body.classList.toggle("simple", on);
+  document.getElementById("mode-plain").classList.toggle("on", on);
+  if (on) setMode("system");
+  loadPlainSummary();
+  loadRecentArrivals(); // headers/cells reword immediately, don't wait for the next tick
+}
+document.getElementById("mode-plain").onclick = () => setPlainMode(!isSimple());
+
 async function refresh() {
   try {
     const d = await loadCounts();
-    await Promise.all([loadKalman(), loadAccuracy(d), loadHeadToHead(), loadRecentArrivals(), loadTrend(), loadImportance(), loadFeature()]);
+    await Promise.all([loadPlainSummary(), loadSysHealth(), loadKalman(), loadAccuracy(d), loadHeadToHead(), loadRecentArrivals(), loadTrend(), loadImportance(), loadFeature()]);
     document.getElementById("status").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) {
     document.getElementById("status").textContent = "error: " + e.message;

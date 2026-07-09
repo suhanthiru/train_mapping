@@ -14,6 +14,7 @@ kalman-rs/target/
 
 # ---- data & databases (large / regenerable) ----
 data/
+backups/
 *.db
 *.db-journal
 *.db-wal
@@ -34,6 +35,8 @@ venv/
 *.joblib
 analytics-py/eta_model.json
 analytics-py/eta_features.json
+analytics-py/eta_model_v2.json
+analytics-py/eta_features_v2.json
 
 # ---- assistant / tooling (keep local, out of the repo) ----
 .claude/

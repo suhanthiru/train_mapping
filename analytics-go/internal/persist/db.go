@@ -4,12 +4,12 @@
 // modernc.org/sqlite driver (no cgo / no native build toolchain), matching
 // the same decision made for node:sqlite over better-sqlite3 on the TS side.
 //
-// Three tables:
-//   occupancy      - time series of vehicle crowding, written ON CHANGE only
-//                    (per-vehicle transitions), for future analytics.
+// Two tables:
 //   baselines      - persisted Welford state per route+direction key, so
 //                    anomaly detection is warm on restart instead of cold.
 //   anomaly_events - one row per anomaly onset, for future analytics.
+// (A third `occupancy` table was REMOVED: the MTA feed's occupancy field is a
+// placeholder — EMPTY for 100% of vehicles — so it was dead data end to end.)
 package persist
 
 import (
@@ -23,23 +23,11 @@ import (
 )
 
 const (
-	occupancyRetentionDays = 30
-	anomalyRetentionDays   = 30
+	anomalyRetentionDays = 30
 )
 
 type DB struct {
-	db      *sql.DB
-	occStmt *sql.Stmt
-}
-
-type OccupancyRow struct {
-	Ts        int64
-	VehicleID string
-	Route     string
-	Mode      string
-	Status    string
-	Pct       float64
-	Lon, Lat  float64
+	db *sql.DB
 }
 
 func Open(path string) (*DB, error) {
@@ -49,13 +37,6 @@ func Open(path string) (*DB, error) {
 	}
 	sqldb.SetMaxOpenConns(1) // single-writer; sidesteps SQLITE_BUSY entirely
 	schema := `
-	CREATE TABLE IF NOT EXISTS occupancy (
-		ts INTEGER NOT NULL, vehicleId TEXT NOT NULL, route TEXT, mode TEXT,
-		status TEXT, pct REAL, lon REAL, lat REAL
-	);
-	CREATE INDEX IF NOT EXISTS idx_occ_ts ON occupancy(ts);
-	CREATE INDEX IF NOT EXISTS idx_occ_route ON occupancy(route, ts);
-
 	CREATE TABLE IF NOT EXISTS baselines (
 		key TEXT PRIMARY KEY, n INTEGER, mean REAL, m2 REAL, updated INTEGER
 	);
@@ -68,31 +49,7 @@ func Open(path string) (*DB, error) {
 	if _, err := sqldb.Exec(schema); err != nil {
 		return nil, err
 	}
-	occStmt, err := sqldb.Prepare(
-		`INSERT INTO occupancy (ts, vehicleId, route, mode, status, pct, lon, lat) VALUES (?,?,?,?,?,?,?,?)`)
-	if err != nil {
-		return nil, err
-	}
-	return &DB{db: sqldb, occStmt: occStmt}, nil
-}
-
-// RecordOccupancy inserts a batch of occupancy transitions in one transaction.
-func (d *DB) RecordOccupancy(rows []OccupancyRow) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	tx, err := d.db.Begin()
-	if err != nil {
-		return err
-	}
-	stmt := tx.Stmt(d.occStmt)
-	for _, r := range rows {
-		if _, err := stmt.Exec(r.Ts, r.VehicleID, r.Route, r.Mode, r.Status, r.Pct, r.Lon, r.Lat); err != nil {
-			tx.Rollback()
-			return err
-		}
-	}
-	return tx.Commit()
+	return &DB{db: sqldb}, nil
 }
 
 // SaveBaselines upserts every current Welford baseline.
@@ -160,9 +117,6 @@ func (d *DB) RecordAnomalyEvents(ts int64, flags []stats.Flag) error {
 // (they're upserted, one row per key).
 func (d *DB) Prune() {
 	now := time.Now().Unix()
-	if _, err := d.db.Exec(`DELETE FROM occupancy WHERE ts < ?`, now-int64(occupancyRetentionDays*86400)); err != nil {
-		log.Printf("[persist] prune occupancy: %v", err)
-	}
 	if _, err := d.db.Exec(`DELETE FROM anomaly_events WHERE ts < ?`, now-int64(anomalyRetentionDays*86400)); err != nil {
 		log.Printf("[persist] prune anomaly_events: %v", err)
 	}

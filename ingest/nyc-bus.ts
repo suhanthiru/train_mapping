@@ -7,7 +7,7 @@ import GtfsRealtimeBindings from "gtfs-realtime-bindings";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { VehicleState } from "../shared/types.ts";
-import { decodeOccupancy } from "../shared/occupancy.ts";
+import { inNycBounds } from "../shared/validate.ts";
 
 const FEED = "https://gtfsrt.prod.obanyc.com/vehiclePositions";
 const BUS_COLOR = "#F0A830"; // warm amber — reads distinctly from the cyan trains
@@ -24,7 +24,9 @@ function toNum(v: unknown): number | undefined {
 export async function fetchNycBuses(): Promise<VehicleState[]> {
   const out: VehicleState[] = [];
   try {
-    const res = await fetch(FEED);
+    // 8s cap — see the matching note in ingest/nyc.ts: a hung fetch here was
+    // observed to stall the whole process, not just this one call.
+    const res = await fetch(FEED, { signal: AbortSignal.timeout(8000) });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(
       new Uint8Array(await res.arrayBuffer())
@@ -34,8 +36,10 @@ export async function fetchNycBuses(): Promise<VehicleState[]> {
       const ve = e.vehicle;
       const p = ve?.position;
       if (!p || p.latitude == null || p.longitude == null) continue;
+      // GPS plausibility: a bus outside the NYC bbox is feed junk (bad fix,
+      // depot test unit) — never let it onto the map or into analytics.
+      if (!inNycBounds(p.longitude, p.latitude)) continue;
       const route = ve!.trip?.routeId || ve!.vehicle?.label || "BUS";
-      const occ = decodeOccupancy(ve!);
       out.push({
         id: `nyc-bus:${e.id}`,
         city: "nyc",
@@ -49,8 +53,6 @@ export async function fetchNycBuses(): Promise<VehicleState[]> {
         pos: [p.longitude, p.latitude],
         elevation: "surface",
         stale: Math.floor(Date.now() / 1000) - ts > 180,
-        occStatus: occ.occStatus,
-        occPct: occ.occPct,
       });
     }
   } catch (e) {
