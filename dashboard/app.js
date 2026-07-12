@@ -150,6 +150,37 @@ async function loadSysHealth() {
   }
 }
 
+// ---- uptime: hourly throughput over the last 24h — feed rows/hr is the
+// truest "was the pipeline alive" signal (model-v1's count is inflated by the
+// known re-logging bug, so it's not used for the uptime read). ----
+async function loadThroughput() {
+  let d;
+  try { d = await getJSON(`${BACKEND}/api/throughput?hours=24`); }
+  catch { document.getElementById("throughput-summary").textContent = "backend not reachable"; return; }
+  const hours = d.hours || [];
+  if (!hours.length) { charts.throughput?.destroy(); return; }
+  const fmtH = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit" });
+  draw("throughput", {
+    type: "bar",
+    data: {
+      labels: hours.map((h) => fmtH(h.hourStart)),
+      datasets: [{ label: "feed rows/hr", data: hours.map((h) => h.feed), backgroundColor: ACCENT, borderRadius: 4 }],
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: { legend: { display: false } },
+      scales: axes("feed rows"),
+    },
+  });
+  const liveHours = hours.filter((h) => h.feed > 0).length;
+  const gapHours = hours.length - liveHours;
+  const pct = Math.round(100 * liveHours / hours.length);
+  const col = gapHours === 0 ? "#7ed957" : gapHours <= 4 ? "#f0c040" : "#e53950";
+  document.getElementById("throughput-summary").innerHTML =
+    `<span style="color:${col}">${liveHours}/${hours.length} hours collecting (${pct}%)</span>` +
+    (gapHours ? ` · ${gapHours}h of gaps — pipeline wasn't running or the feed was unreachable` : " · fully up this window");
+}
+
 async function loadCounts() {
   const d = await getJSON(`${BACKEND}/api/prediction-accuracy`);
   const c = d.counts || {};
@@ -305,6 +336,69 @@ async function loadFeature() {
   });
 }
 
+// ---- graph GNN experiment: Baseline / Graph A / Graph B / Graph C ----
+// Reads the frozen offline result (analytics-py/graph_experiment.py). Graph A
+// (FOLLOWS-only) is the winner; B/C add nothing — the panel shows that plainly.
+async function loadGraphExperiment() {
+  const panel = document.getElementById("graph-panel");
+  let d;
+  try { d = await getJSON(`${BACKEND}/api/graph-experiment`); }
+  catch { return; }
+  const cardsEl = document.getElementById("graph-cards");
+  const verdictEl = document.getElementById("graph-verdict");
+  const titleEl = document.getElementById("graph-title");
+  const subEl = document.getElementById("graph-sub");
+  const simple = isSimple();
+  if (!d || d.available === false || !d.short_lead_mae) {
+    charts["graph-mae"]?.destroy();
+    cardsEl.innerHTML = '<div class="empty">no experiment yet — run <span class="mono">python analytics-py/graph_experiment.py</span></div>';
+    verdictEl.textContent = "";
+    return;
+  }
+  const m = d.short_lead_mae; // {baseline, graph_a, graph_b, graph_c}
+  const order = ["baseline", "graph_a", "graph_b", "graph_c"];
+  const nice = { baseline: "Baseline (v2)", graph_a: "Graph A · FOLLOWS", graph_b: "Graph B · +SHARES", graph_c: "Graph C · network" };
+  const base = m.baseline;
+  const best = order.slice(1).reduce((b, k) => (m[k] < m[b] ? k : b), "graph_a");
+
+  if (titleEl) titleEl.textContent = simple ? "Can nearby trains improve our guess?" : "Graph GNN experiment — cross-train residual correction";
+  if (subEl) subEl.textContent = simple
+    ? "we tested whether looking at nearby trains helps our newest prediction. Lower bar = more accurate."
+    : "offline A/B/C test: does a GNN using nearby trains (FOLLOWS = same line ahead, SHARES_TRACK = cross-route junction) correct model-v2's error? Each bar = short-lead (0–2 min) MAE; lower is better.";
+
+  cards(cardsEl, order.map((k) => ({
+    k: simple ? nice[k].split(" · ")[0] : nice[k],
+    v: simple ? fmtDuration(m[k]) : `${m[k]}s`,
+  })));
+
+  const colorFor = (k) => k === "baseline" ? "#8b98a5" : k === best ? "#7ed957" : ACCENT;
+  draw("graph-mae", {
+    type: "bar",
+    data: {
+      labels: order.map((k) => nice[k]),
+      datasets: [{ label: "short-lead MAE (s)", data: order.map((k) => m[k]), backgroundColor: order.map(colorFor), borderRadius: 4 }],
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: axes("MAE (s)") },
+  });
+
+  // verdict line — honest: A beats baseline, B/C add nothing
+  const impr = Math.round((base - m.graph_a) * 10) / 10;
+  const pct = Math.round(100 * (base - m.graph_a) / base);
+  const v = d.verdicts || {};
+  if (simple) {
+    verdictEl.innerHTML =
+      `<b style="color:#7ed957">Looking at the train ahead on the same line makes our guess about ${fmtDuration(impr)} more accurate</b> ` +
+      `(~${pct}% better). Adding cross-line junctions or the whole network on top of that didn't help — the train directly ahead is what matters.`;
+  } else {
+    const tag = (ok) => ok === "PASS" ? '<span style="color:#7ed957">PASS</span>' : '<span style="color:var(--muted)">no gain</span>';
+    verdictEl.innerHTML =
+      `<b>Graph A</b> (FOLLOWS-only) beats baseline by <b>${impr}s</b> (~${pct}%): ${tag(v.graph_a_vs_baseline)}. ` +
+      `<b>Graph B</b> vs A: ${tag(v.graph_b_vs_a)}. <b>Graph C</b> vs B: ${tag(v.graph_c_vs_b)}. ` +
+      `→ the same-line train ahead carries the signal; cross-route + whole-network add nothing at this data volume. ` +
+      `<span style="color:var(--muted)">n=${(d.n_test_nodes ?? 0).toLocaleString()} test nodes${v.underpowered ? " · UNDERPOWERED" : ""} · directional (4–5 day data)</span>`;
+  }
+}
+
 // ---- recent arrivals scorecard: estimated ETA vs ATA, case by case ----
 async function loadRecentArrivals() {
   let d;
@@ -392,13 +486,14 @@ function setPlainMode(on) {
   if (on) setMode("system");
   loadPlainSummary();
   loadRecentArrivals(); // headers/cells reword immediately, don't wait for the next tick
+  loadGraphExperiment();
 }
 document.getElementById("mode-plain").onclick = () => setPlainMode(!isSimple());
 
 async function refresh() {
   try {
     const d = await loadCounts();
-    await Promise.all([loadPlainSummary(), loadSysHealth(), loadKalman(), loadAccuracy(d), loadHeadToHead(), loadRecentArrivals(), loadTrend(), loadImportance(), loadFeature()]);
+    await Promise.all([loadPlainSummary(), loadSysHealth(), loadThroughput(), loadKalman(), loadAccuracy(d), loadHeadToHead(), loadGraphExperiment(), loadRecentArrivals(), loadTrend(), loadImportance(), loadFeature()]);
     document.getElementById("status").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) {
     document.getElementById("status").textContent = "error: " + e.message;

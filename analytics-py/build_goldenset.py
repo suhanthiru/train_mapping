@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 
 import polars as pl
 
+import mta_ridership
+
 HERE = os.path.dirname(__file__)
 # Env-overridable to match the container's bind mounts (see docker-compose.yml).
 LEDGER = os.environ.get("LEDGER_DB", os.path.join(HERE, "..", "data", "ledger.db"))
@@ -52,6 +54,12 @@ def main():
         ).fetchone()
         return 1 if (r and r[0]) else 0
 
+    # Ridership is NOT a stored per-observation column — it's a static busyness
+    # profile keyed on (station, hour, dow). train_eta.py joins it at train time,
+    # so the golden set was previously blind to the feature the live model uses.
+    # Join it here too (same busyness() call) so golden-set A/B analysis sees it.
+    mta_ridership.ensure_profile()
+
     rows = []
     for s in segs:
         d = dict(zip(cols, s))
@@ -67,6 +75,8 @@ def main():
         d["frac_hop_5min"], d["trains_ahead_5min"] = fr, ah
         d["direction"] = to[-1] if to and to[-1] in "NS" else ""
         d["alert_active"] = alert_active(route, ata)
+        b = mta_ridership.busyness(to, d["hour"] or 0, d["dow"] or 0)
+        d["ridership"] = b if b is not None else 0.0
         rows.append(d)
     con.close()
 

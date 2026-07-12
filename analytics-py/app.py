@@ -24,6 +24,7 @@ from pydantic import BaseModel
 import weather
 import nyc311
 import mta_ridership
+import active_alerts
 import train_eta
 import build_goldenset
 
@@ -102,6 +103,19 @@ def do_retrain():
 
 
 def _scheduler():
+    # Anchor the cadence to the model file's own mtime (I10) instead of always
+    # sleeping a fresh RETRAIN_EVERY_S from process start. MODEL_PATH already
+    # survives restarts via MODEL_DIR's persistent volume (I2), so its mtime is
+    # a durable "last trained" marker for free -- no new state file needed. A
+    # host that restarts more often than the retrain cadence was previously
+    # never reaching a real 6h cycle: this catches up immediately if the model
+    # is already overdue, then falls into the normal interval.
+    if os.path.exists(MODEL_PATH):
+        remaining = RETRAIN_EVERY_S - (time.time() - os.path.getmtime(MODEL_PATH))
+        if remaining > 0:
+            time.sleep(remaining)
+        else:
+            do_retrain()
     while True:
         time.sleep(RETRAIN_EVERY_S)
         do_retrain()
@@ -121,7 +135,8 @@ def health():
         s["v2_n_train"], s["v2_mae"] = _feats_v2.get("n_train"), _feats_v2.get("mae")
     return {"ok": True, "model_loaded": _model is not None,
             "model_v2_loaded": _model_v2 is not None,
-            "ridership": mta_ridership.status(), **s}
+            "ridership": mta_ridership.status(),
+            "alerts": active_alerts.status(), **s}
 
 
 @app.post("/retrain")
@@ -203,13 +218,17 @@ def _feature_row(feats: dict, vals: dict) -> list[float]:
 
 
 def _enrich(vals: dict, feats: dict) -> dict:
-    """Server-side features Node doesn't send. Ridership is computed here (and
-    identically at train time) so the two can't drift; only when the loaded
-    model actually uses it, so old models never trigger the profile fetch."""
-    if "ridership" in feats.get("feat_order", []):
+    """Server-side features Node doesn't send. Ridership/alert_active are
+    computed here (and identically at train time) so the two can't drift;
+    only when the loaded model actually uses them, so old models never
+    trigger the profile fetch / alert lookup."""
+    feat_order = feats.get("feat_order", [])
+    if "ridership" in feat_order:
         vals["ridership"] = mta_ridership.busyness(
             vals.get("to_stop", ""), int(vals.get("hour", 12)), int(vals.get("dow", 1))
         )
+    if "alert_active" in feat_order:
+        vals["alert_active"] = 1.0 if active_alerts.is_active(vals.get("route_id")) else 0.0
     return vals
 
 

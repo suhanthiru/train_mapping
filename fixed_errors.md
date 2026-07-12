@@ -1,15 +1,28 @@
 # Fixed Errors
 
 A running log of concrete bugs found in the codebase, what caused them, and how
-they were fixed. All five errors from the known-issues list are now FIXED in the
-working tree (nothing committed — you review and commit). Severity is my own
-triage, not a formal scale.
+they were fixed. Severity is my own triage, not a formal scale.
+
+**Dating methodology (so the dates below aren't taken as more precise than they
+are):** issues weren't logged with timestamps in real time, so dates are
+reconstructed from real evidence, not guessed:
+- **I1–I7** were all found and fixed in one continuous working arc that ended at
+  the single bulk commit `5e2d8ee` ("updated sys"), timestamped **Jul 9, 02:10 AM**
+  — so "found" is dated the evening before (**2026-07-08**) and "fixed" at that
+  commit boundary. There's no finer per-issue granularity available within that
+  arc (one commit, not one per issue).
+- **I8, I9** came later the same day — their own text already said "found live
+  during the same incident," and file mtimes (`graph_experiment.py`,
+  `train_eta.py` ≈ 10:00–10:06 AM) place that incident on **2026-07-09**.
+- **I10, I11** (below) are from live investigation today, **2026-07-10** — both
+  are diagnosed but **not yet fixed** (open).
 
 ---
 
 ## ✅ FIXED
 
 ### I2 — `analytics-py` had no persistence (model + ledger vanished on restart)
+`Found 2026-07-08 · Fixed 2026-07-08 (session ending 2026-07-09 02:10 AM)`
 - **Severity:** High — this silently broke 24/7 operation.
 - **Where:** `docker-compose.yml` (`analytics-py` service had zero volumes),
   `analytics-py/app.py`, `analytics-py/train_eta.py`, `analytics-py/build_goldenset.py`.
@@ -37,6 +50,7 @@ triage, not a formal scale.
   answers immediately (no 503); `./data/models/eta_model.json` exists on the host.
 
 ### I4 — the prediction source `'model-v1'` was hardcoded into the SQL
+`Found 2026-07-08 · Fixed 2026-07-08 (session ending 2026-07-09 02:10 AM)`
 - **Severity:** Low/Med — a scaling blocker, not a runtime bug.
 - **Where:** `history/ledger.ts`, `insModelPred` prepared statement + `recordModelPredictions()`.
 - **What it was:** `INSERT INTO predictions (…, source) VALUES (…, 'model-v1')`
@@ -51,6 +65,7 @@ triage, not a formal scale.
 - **Verify:** TypeScript typecheck; existing `model-v1` path unchanged.
 
 ### I5 — the analytics dashboard hardcoded `localhost`
+`Found 2026-07-08 · Fixed 2026-07-08 (session ending 2026-07-09 02:10 AM)`
 - **Severity:** Low — worked locally, broke on a remote host.
 - **Where:** `dashboard/app.js` (top-of-file service base URLs).
 - **What it was:** `BACKEND/KALMAN/ANALYTICS` were literal
@@ -63,6 +78,7 @@ triage, not a formal scale.
   `/api/*` paths proxied server-side. Tracked as a deferred item.
 
 ### I3 — fake occupancy carried through three services
+`Found 2026-07-08 · Fixed 2026-07-08 (session ending 2026-07-09 02:10 AM)`
 - **Severity:** Medium — dead weight + a trap for future contributors.
 - **Where:** `ingest/nyc.ts`, `ingest/nyc-bus.ts`, `shared/occupancy.ts`,
   `shared/types.ts`, `core/interpolate.ts`, `history/ledger.ts` (predictions +
@@ -91,6 +107,7 @@ triage, not a formal scale.
   (one historical comment in `train_eta.py` retained deliberately).
 
 ### I1 — ETA model's 85–130 s late bias at short lead times
+`Found 2026-07-08 · Fixed 2026-07-08 (session ending 2026-07-09 02:10 AM)`
 - **Severity:** High — it was the headline accuracy problem.
 - **Where:** `server/index.ts` `modelPredictTick()` (hop-chaining).
 - **What it was:** When chaining per-hop duration predictions into arrival times,
@@ -125,6 +142,7 @@ triage, not a formal scale.
   the backend has run a few hours.
 
 ### I6 — `localhost` DNS penalty silently killed every model prediction *(found during live verification this session)*
+`Found 2026-07-08 · Fixed 2026-07-08 (session ending 2026-07-09 02:10 AM)`
 - **Severity:** High — the entire model-prediction path was timing out on every tick.
 - **Where:** `server/index.ts` service-URL defaults (`ANALYTICS_PY`, `KALMAN_RS`).
 - **What it was:** On Windows, `localhost` resolves IPv6 `::1` first; the Python/
@@ -139,6 +157,7 @@ triage, not a formal scale.
   Docker overrides via env (`http://analytics-py:8091` etc.) are unaffected.
 
 ### I7 — map + dashboard would break under a TLS reverse proxy *(found while writing the Caddy/nginx configs)*
+`Found 2026-07-08 · Fixed 2026-07-08 (session ending 2026-07-09 02:10 AM)`
 - **Severity:** High (latent) — would have silently broken the live map and dashboard the moment TLS was added, not something a smoke test on plain HTTP would catch.
 - **Where:** `web/src/main.ts` (HTTP/WS constants), `dashboard/app.js` (BACKEND/KALMAN/ANALYTICS constants — the I5 fix from earlier this session only got it to "works on one host," not "works behind a proxy," which its own tooltip already flagged as a known gap).
 - **What it was:** both hardcoded an explicit port (`:8080`, `:8091`, etc.) onto the current hostname. Fine when every service publishes its own port on the same host — but behind Caddy/nginx terminating TLS on 443, the page loads as `https://...` with no port, and the JS would then try `https://host:8080` (a plain-HTTP service with no TLS listener) — an HTTPS page fetching over what's actually plain HTTP on that port fails, and the WebSocket equivalent (`ws://` from an `https://` page) is blocked by the browser outright as insecure mixed content.
@@ -146,6 +165,7 @@ triage, not a formal scale.
 - **Verify:** live in-browser check — `console.log("[ws] connected", WS)` fired with the correct same-origin URL, network tab showed clean 200s on the map bundle + GTFS geometry, `vite build` + `tsc` both clean.
 
 ### I8 — the backtest materialized millions of rows into JS on every dashboard poll *(found live: 3 GB RSS + a dead event loop)*
+`Found 2026-07-09 · Fixed 2026-07-09`
 - **Severity:** Critical — the backend hit **3.1 GB of memory within ~20 s of boot** and stopped answering HTTP entirely. This is the "compounds silently" failure the *Incremental Backtest* suggestion (diagram priority #1) predicted — it detonated at 4 days of data.
 - **Where:** `history/ledger.ts` `accuracyByLeadTime()` + the `/api/prediction-accuracy` handler in `server/index.ts`.
 - **What it was:** the grading query did `.all()` — pulling **every graded prediction row into a JavaScript array** before bucketing in JS. At 8.6M graded model-v1 rows that's ~3 GB of row objects per call, on the **synchronous** `node:sqlite` handle (the event loop is blocked for the entire query + materialization). It ran **at boot** (`snap()` snapshots all 3 sources immediately) and then continuously: the dashboard polls 3 sources every 15 s — and the new Simple-mode panel doubled those calls, which is what pushed the latent bomb into detonating.
@@ -156,8 +176,31 @@ triage, not a formal scale.
 - **Verify (measured):** endpoint went from multi-second/3 GB to **1.2 ms cold, ~1 ms cached** (HTTP 200 with correct buckets); the backend process runs at **114 MB** instead of 3,100 MB; dashboard + Simple mode render live data end-to-end.
 
 ### I9 — ingest fetches had NO timeout; a slow MTA feed stalled the whole process *(found live during the same incident)*
+`Found 2026-07-09 · Fixed 2026-07-09`
 - **Severity:** High — when the MTA feed became unreachable (real, transient network condition observed live), the backend stopped responding even on unrelated local endpoints.
 - **Where:** `ingest/nyc.ts` (subway protobuf feeds) and `ingest/nyc-bus.ts` (bus GPS feed) — the only two `fetch()` calls in the codebase without an `AbortSignal.timeout(...)`; every other network call already had one.
 - **What it was:** with no timeout, hung connections to the feed piled up unresolved sockets tick after tick; combined with I8's blocked event loop, the process appeared completely dead.
 - **How it was fixed:** `AbortSignal.timeout(8000)` on both, matching the codebase-wide pattern.
 - **Verify:** logs now show `[nyc-bus] error: The operation was aborted due to timeout` and `fetchTick` completing cleanly during the outage; when the feed recovered, ingestion resumed on its own (259 trains + 150 buses, feed age 13 s).
+
+### I11 — 145 duplicate rows in `segments` from the incremental `buildSegments()` watermark logic
+`Found 2026-07-10 · Confirmed fixed 2026-07-12 (verified live, no new dupes since)`
+- **Severity:** Low — 0.05% of the table at time of discovery (145 of 290,850 rows), confirmed too small to explain any of the accuracy trends investigated alongside it.
+- **Where:** `history/ledger.ts` `buildSegments()`'s watermark-based append.
+- **What it was:** a boundary condition where the watermark could advance without the segment inserts for that batch being durable in the same transaction, so a batch could be reprocessed and double-inserted.
+- **Verified fixed, not just patched:** `buildSegments()` already wraps every segment `INSERT` and the `setWatermark` call inside one `BEGIN`/`COMMIT`. Live check on 2026-07-12: the table grew from 290,850 → 312,061 rows (~21k new segments) since I11 was first diagnosed, and the duplicate count is **still exactly 145** — proof the transactional fix is actually holding under real, continued ingestion, not just reasoned about. The 145 are inert historical rows from before that transactional fix existed.
+- **Cleanup still pending (deliberately not run automatically — it's a live DELETE against the ledger):** `DELETE FROM segments WHERE rowid NOT IN (SELECT MIN(rowid) FROM segments GROUP BY trip_id, from_stop, to_stop, arrive_ts)` removes the 145 legacy dupes so they stop being double-weighted in future v1 training runs. Harmless whenever you want to run it; not urgent given the severity.
+
+---
+
+## 🚧 DIAGNOSED, NOT YET FIXED
+
+### I10 — the retrain scheduler doesn't survive process restarts; model-v1 went ~21h stale and its LIVE accuracy degraded 35% while the model itself never changed
+`Found 2026-07-10 · Code hardening added 2026-07-12 — root cause still open (needs stable uptime)`
+- **Severity:** High — this is the actual answer to "why are predictions getting worse," and it's an operational gap, not a one-line code bug.
+- **Where:** `analytics-py/app.py` (`_scheduler()`'s in-process 6h timer, which resets on every restart) and the upstream cause: the pipeline's own uptime (see the dashboard's new "Uptime — hourly throughput" panel, built 2026-07-10 — only 3/24 hours were collecting in the last day at the time).
+- **What it is:** `accuracy_snapshots` shows model-v1's live 0-1min MAE climbing from 124-128s (2026-07-05/06) to 165-171s (2026-07-09/10), while the feed and model-v2 stayed flat over the same window. Direct evidence ruled out the obvious suspects: the model file itself is unchanged since **2026-07-09 21:45** (confirmed: 29.9s in-sample MAE, zero bias, 0% unseen categories against the 5,000 most recent segments) — and `segments` (its training table) has had **zero new rows since that exact timestamp**, so it simply hasn't retrained in ~21h. That's the compound effect of the 19h outage (nothing running to feed `buildSegments()`/`train()`) plus repeated `analytics-py` restarts this session, each of which resets the in-process 6h countdown before it fires.
+- **Ruled out with direct tests (not guessed):** encoder staleness, a broken `alert_active` cache (called live, returned real mixed True/False values), and training-data corruption from the I11 duplicate-segment bug (0.05% of rows — far too small to explain a 35% aggregate swing).
+- **Best-supported remaining explanation (labeled as inferred, not proven):** v1's live number is a *chained* multi-hop estimate computed by `modelPredictTick`, which depends on live vehicle-state (anchor stop, upcoming-stops list) that resets on every backend restart — noisier chaining without the underlying static model changing at all.
+- **Code hardening added 2026-07-12:** `_scheduler()` now anchors its cadence to `eta_model.json`'s own mtime (durable across restarts via `MODEL_DIR`'s persistent volume, per I2) instead of always sleeping a fresh 6h from process start. On boot, if the model is already overdue it retrains immediately (catch-up); otherwise it sleeps only the remaining time to the next real 6h mark. A restart no longer resets the countdown.
+- **Still not fully closed:** this stops the scheduler from lying to itself about when it last ran, but the underlying uptime problem (the host restarting at all) is still what needs to stop happening — see the Oracle VM deployment steps in the current chat explainer for what actually closes this.

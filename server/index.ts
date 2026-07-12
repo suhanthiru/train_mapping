@@ -60,6 +60,90 @@ try {
   }
 } catch { /* elevation data optional */ }
 
+// Graph topology (Phase 1 output of the graph-ETA plan): the FOLLOWS canonical
+// stop ordering per route+direction and the SHARES_TRACK junction zones. Used
+// to overlay the live graph structure on the map (the "how the graph thinks"
+// toggle) — no model involved, just which trains the graph would connect + why.
+// Optional: absent until `python analytics-py/graph_edges.py` has been run.
+let followsOrder: Record<string, Record<string, number>> = {};
+interface ShareZone { route_a: string; route_b: string; direction: string; stops: Set<string> }
+let shareZones: ShareZone[] = [];
+try {
+  const gdir = join(DATA_DIR, "exports", "graph");
+  followsOrder = JSON.parse(readFileSync(join(gdir, "follows_order.json"), "utf8"));
+  const rawZones = JSON.parse(readFileSync(join(gdir, "shares_track.json"), "utf8")) as any[];
+  // trust only the stop-id-run zones for the live overlay (geometric-fallback
+  // zones are flagged for manual review in the plan, not auto-trusted)
+  shareZones = rawZones
+    .filter((z) => z.source === "stopseq")
+    .map((z) => ({ route_a: z.route_a, route_b: z.route_b, direction: z.direction, stops: new Set<string>(z.stop_ids) }));
+  console.log(`[server] graph topology: ${Object.keys(followsOrder).length} FOLLOWS spines, ${shareZones.length} SHARES_TRACK zones`);
+} catch { /* graph topology optional — run analytics-py/graph_edges.py to generate */ }
+
+interface GraphEdge { a: string; b: string; type: "follows" | "shares"; metric: string }
+
+// Compute the live graph edges among currently-visible trains: FOLLOWS (each
+// train -> the next train ahead on its own route+direction) and SHARES_TRACK
+// (a train -> the nearest cross-route train sharing its track at a junction).
+// Cheap: O(n log n) for the FOLLOWS sort + a bounded scan per share-zone.
+function computeGraphEdges(trains: VehicleState[]): GraphEdge[] {
+  if (!Object.keys(followsOrder).length) return [];
+  interface TI { id: string; route: string; dir: string; toStop: string; spinePos: number; pos: [number, number] | undefined }
+  const info: TI[] = [];
+  for (const t of trains) {
+    if (!t.shapeId) continue;
+    const hop = interp.currentHop(t.shapeId, t.dist);
+    if (!hop) continue;
+    const dir = hop.toStop.slice(-1);
+    if (dir !== "N" && dir !== "S") continue;
+    const order = followsOrder[`${t.route}|${dir}`];
+    if (!order) continue;
+    // linear position along the canonical spine: index of the stop being
+    // approached, minus the fraction still to travel (so a train 0.3 into the
+    // hop from stop 4 -> 5 sits at 4.3, strictly between the two stops)
+    const toIdx = order[hop.toStop];
+    if (toIdx === undefined) continue;
+    const fromIdx = order[hop.fromStop];
+    const spinePos = fromIdx !== undefined ? fromIdx + hop.frac : toIdx - (1 - hop.frac);
+    info.push({ id: t.id, route: t.route, dir, toStop: hop.toStop, spinePos, pos: stopPos[hop.toStop] });
+  }
+
+  const edges: GraphEdge[] = [];
+  // FOLLOWS: sort each route+direction group by spine position, link adjacent
+  const byRD = new Map<string, TI[]>();
+  for (const x of info) {
+    const k = `${x.route}|${x.dir}`;
+    let arr = byRD.get(k);
+    if (!arr) { arr = []; byRD.set(k, arr); }
+    arr.push(x);
+  }
+  for (const arr of byRD.values()) {
+    arr.sort((p, q) => p.spinePos - q.spinePos);
+    for (let i = 0; i + 1 < arr.length; i++) {
+      const gap = arr[i + 1].spinePos - arr[i].spinePos;
+      edges.push({ a: arr[i].id, b: arr[i + 1].id, type: "follows", metric: `${gap.toFixed(1)} stops apart` });
+    }
+  }
+  // SHARES_TRACK: within each junction zone, link each route_a train currently
+  // in the zone to the geographically-nearest route_b train also in the zone
+  for (const z of shareZones) {
+    const inA = info.filter((x) => x.route === z.route_a && x.dir === z.direction && z.stops.has(x.toStop));
+    const inB = info.filter((x) => x.route === z.route_b && x.dir === z.direction && z.stops.has(x.toStop));
+    if (!inA.length || !inB.length) continue;
+    for (const a of inA) {
+      let best: TI | undefined;
+      let bestD = Infinity;
+      for (const b of inB) {
+        if (!a.pos || !b.pos) continue;
+        const d = haversine(a.pos, b.pos);
+        if (d < bestD) { bestD = d; best = b; }
+      }
+      if (best) edges.push({ a: a.id, b: best.id, type: "shares", metric: `${z.route_a}/${z.route_b} shared track` });
+    }
+  }
+  return edges;
+}
+
 let latest: VehicleState[] = [];
 let lastRaws: RawVehicle[] = [];
 let lastBuses: VehicleState[] = [];
@@ -144,6 +228,15 @@ async function alertsTick() {
 // model's hop-by-hop duration guesses (anchor -> upcoming[0] -> upcoming[1]...)
 // into cumulative arrival times, in one batched call (mirrors kalman-rs's
 // POST /filter batch shape) so a tick with hundreds of trains is one request.
+
+// Cap how many upcoming hops model-v1 chains + logs per train per tick. A train
+// can have ~30 upcoming stops; logging a chained ETA for every one of them every
+// tick is what made model-v1 74% of the ledger (24M rows), and those far-future
+// chained hops are the high-bias, low-value ones (see I10). Short-lead accuracy
+// is what matters, and capping here also shrinks the /predict-batch payload sent
+// to analytics-py. Retention stays 30 days — this only reduces write volume,
+// never deletes existing history.
+const MODEL_V1_MAX_HOPS = 3;
 async function modelPredictTick(raws: RawVehicle[]): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   const nowDate = new Date(now * 1000);
@@ -162,7 +255,8 @@ async function modelPredictTick(raws: RawVehicle[]): Promise<void> {
     if (!anchor) continue; // nothing to chain the first hop from — skip this tick
     const hopIds: string[] = [];
     const targetStops: string[] = [];
-    for (let i = 0; i < v.upcoming.length; i++) {
+    const maxHops = Math.min(v.upcoming.length, MODEL_V1_MAX_HOPS);
+    for (let i = 0; i < maxHops; i++) {
       const to = v.upcoming[i].stopId;
       if (!to) continue;
       const from = i === 0 ? anchor : v.upcoming[i - 1].stopId;
@@ -304,7 +398,7 @@ async function pushTick() {
   latest = [...trains, ...lastBuses];
   history.record(now, trains);
   logVehicleState(trains, now);
-  broadcast({ type: "state", city: "nyc", ts: now, vehicles: latest });
+  broadcast({ type: "state", city: "nyc", ts: now, vehicles: latest, graphEdges: computeGraphEdges(trains) });
 }
 
 const CONGEST_WINDOW_M = 1200; // same-shape trains within this many meters ahead = congestion
@@ -415,6 +509,31 @@ const server = createServer(async (req, res) => {
         dest: stops.length ? stops[stops.length - 1].name : undefined,
         stops,
       })
+    );
+    return;
+  }
+
+  // Offline graph-ETA experiment results (Baseline/Graph A/B/C residual GNN).
+  // Served straight from the Parquet-adjacent JSON the experiment writes; the
+  // experiment itself never touches the live ledger, so this is read-only glass
+  // onto a frozen result. Absent until analytics-py/graph_experiment.py has run.
+  if (url === "/api/graph-experiment") {
+    try {
+      const body = readFileSync(join(DATA_DIR, "exports", "graph", "experiment_report.json"), "utf8");
+      res.writeHead(200, { "Content-Type": "application/json" }).end(body);
+    } catch {
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ available: false }));
+    }
+    return;
+  }
+
+  // Hourly throughput — uptime at a glance: a live/collecting hour has nonzero
+  // feed + vehicleLog; a zero hour means the pipeline wasn't running or the
+  // feed was unreachable, not that no trains moved.
+  if (url === "/api/throughput") {
+    const hours = Number(new URLSearchParams((req.url ?? "").split("?")[1] ?? "").get("hours")) || 24;
+    res.writeHead(200, { "Content-Type": "application/json" }).end(
+      JSON.stringify({ hours: ledger.hourlyThroughput(Math.min(hours, 168)) })
     );
     return;
   }

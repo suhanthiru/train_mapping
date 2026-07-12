@@ -5,7 +5,7 @@
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { MapboxOverlay } from "@deck.gl/mapbox";
-import { PathLayer, ScatterplotLayer } from "@deck.gl/layers";
+import { PathLayer, ScatterplotLayer, ArcLayer } from "@deck.gl/layers";
 import { SimpleMeshLayer } from "@deck.gl/mesh-layers";
 import type { PickingInfo } from "@deck.gl/core";
 import { distToLonLat, bearingAt, type Shape } from "./geo.ts";
@@ -72,6 +72,10 @@ interface AnomalySummary {
   gapSeconds: number; zscore: number; kind: "bunching" | "gap"; why: string;
 }
 const buses = new Map<string, Bus>();
+// Live graph edges from the backend (Y toggle): which trains the graph connects
+// and why. Populated from each WS state message; endpoints resolved from the
+// rendered train positions at draw time.
+let graphEdges: { a: string; b: string; type: "follows" | "shares"; metric: string }[] = [];
 const CAR_MESH = trainCarMesh();
 const BUS_MESH = busMesh();
 const CARS_PER_TRAIN = 5;
@@ -87,6 +91,7 @@ let showBuses = true;
 let pausePush = false;
 let depthMode = false; // E: real elevation-driven z vs flat (z=0, today's look)
 let showUncertainty = false; // K: Kalman position-uncertainty halos (default off)
+let showGraph = false; // Y: graph overlay — FOLLOWS + SHARES_TRACK edges between trains
 let statBase = "connecting…";
 let fpsCount = 0, fpsLast = performance.now(), fpsVal = 0;
 window.addEventListener("keydown", (e) => {
@@ -102,6 +107,7 @@ window.addEventListener("keydown", (e) => {
   else if (k === "p") pausePush = !pausePush;
   else if (k === "e") depthMode = !depthMode;
   else if (k === "k") showUncertainty = !showUncertainty;
+  else if (k === "y") showGraph = !showGraph;
 });
 
 const routeOfShape = (id: string) => id.split("..")[0];
@@ -369,7 +375,38 @@ async function pollAnomalies() {
 setInterval(pollAnomalies, 5000);
 pollAnomalies();
 
-function updateLayers() { overlay.setProps({ layers: [...staticLayers, ...trainLayers(), ...busLayers()] }); }
+// Graph overlay (Y toggle): draw each backend graph edge as an arc between the
+// two trains' live rendered positions. FOLLOWS = cyan (same line, headway),
+// SHARES_TRACK = orange (cross-route junction). Endpoints resolved from the
+// vehicles map by id; edges whose trains have scrolled off are skipped.
+function graphLayers() {
+  if (!showGraph || !graphEdges.length) return [];
+  const data = graphEdges
+    .map((e) => {
+      const from = vehicles.get(e.a)?.position;
+      const to = vehicles.get(e.b)?.position;
+      return from && to ? { ...e, from, to } : null;
+    })
+    .filter((e): e is NonNullable<typeof e> => e !== null);
+  const color = (d: { type: string }): [number, number, number] =>
+    d.type === "follows" ? [80, 200, 255] : [255, 130, 60];
+  return [
+    new ArcLayer({
+      id: "graph-edges",
+      data,
+      getSourcePosition: (d: any) => d.from,
+      getTargetPosition: (d: any) => d.to,
+      getSourceColor: color,
+      getTargetColor: color,
+      getWidth: 2.5,
+      getHeight: 0.3,
+      pickable: true,
+      parameters: { depthTest: false },
+    }),
+  ];
+}
+
+function updateLayers() { overlay.setProps({ layers: [...staticLayers, ...trainLayers(), ...busLayers(), ...graphLayers()] }); }
 
 // --- animation: dead-reckon anchor forward (boosted) + ease render toward it ---
 let lastT = performance.now();
@@ -412,7 +449,7 @@ function frame(now: number) {
     if (now - fpsLast > 500) {
       fpsVal = Math.round((fpsCount * 1000) / (now - fpsLast));
       fpsCount = 0; fpsLast = now;
-      statEl.textContent = `${statBase} · ${fpsVal} fps · [B]ldg [G]low [T]rain [V]bus [P]ause [E]levation [K]alman`;
+      statEl.textContent = `${statBase} · ${fpsVal} fps · [B]ldg [G]low [T]rain [V]bus [P]ause [E]levation [K]alman [Y]graph`;
     }
   } catch (e) {
     console.error("[frame] error (loop continues):", e);
@@ -465,6 +502,13 @@ function onHover(info: PickingInfo) {
     tipEl.style.left = info.x + 14 + "px";
     tipEl.style.top = info.y + 14 + "px";
     tipEl.innerHTML = `<b>${s.name}</b><br><span style="opacity:.6">station · click for arrivals</span>`;
+  } else if (info.object && id === "graph-edges") {
+    const e = info.object as { type: string; metric: string };
+    tipEl.style.display = "block";
+    tipEl.style.left = info.x + 14 + "px";
+    tipEl.style.top = info.y + 14 + "px";
+    const label = e.type === "follows" ? "FOLLOWS (same line)" : "SHARES_TRACK (junction)";
+    tipEl.innerHTML = `<b>${label}</b><br><span style="opacity:.6">${e.metric}</span>`;
   } else {
     tipEl.style.display = "none";
   }
@@ -530,6 +574,7 @@ function connect() {
     const m = JSON.parse(e.data);
     if (m.type === "snapshot" || m.type === "state") {
       applyState(m.vehicles ?? []);
+      graphEdges = m.graphEdges ?? [];
       if (!loggedFirst) {
         loggedFirst = true;
         console.log(`[ws] ${m.type}: ${m.vehicles?.length ?? 0} -> ${vehicles.size} rendered`);

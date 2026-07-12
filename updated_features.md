@@ -129,6 +129,98 @@ exports) — reconciliation found the gap was analytical *queries*, so:
 - First run delivered the headline measurement: model-v1 bias +129 s (0–1 min)
   / +127 s (1–2 min) vs the feed's +8 s / +3 s.
 
+### Incremental `buildSegments()`  ✅ built
+`history/ledger.ts`'s `buildSegments()` used to `DELETE FROM segments` and rebuild
+the entire table from all of `actuals` every hour — cost that grows with total
+history forever. Now watermark-based: a `segments_watermark` row tracks the last
+processed `actual_arrival`; each run only reads newer actuals and INSERTs (segments
+are immutable once a hop completes, so append-only is correct). A new
+`idx_actuals_trip_ts` index supports the per-row predecessor lookup.
+- **Verified:** first run did the one-time full pass (271k rows, 6.2 s); an
+  immediate second run with no new actuals processed 0 rows in **16 ms** (~390×
+  faster, and now flat regardless of table size).
+
+### `alert_active` promoted into the live model  ✅ built + retrained
+`build_goldenset.py` had computed `alert_active` (is there an active MTA service
+alert for this route around this time) for offline exploration since Phase 6, but
+it was never a live feature — the same "already computed, never wired in" story
+`ridership` had. Now:
+- New `analytics-py/active_alerts.py` — a local cache over `alerts_log` (no network
+  call; same file the trainer already reads), refreshed ~60 s, `is_active(route)`.
+- Added to both `train()` and `train_v2()` via a bisect-indexed `alerts_log` join
+  (mirrors `build_goldenset.py`'s ±200 s window), and to `app.py`'s `_enrich()`
+  serving path — same pattern as ridership, so train/serve can't drift.
+- **Not marginal — real signal:** after retrain, gain = **1.53 M** for v1 (above
+  `weather_score`) and **10.6 M** for v2 (also above weather). Live-verified on
+  `/feature-importance`; empty-alert and unknown-route cases handled safely.
+
+### Graph-ETA experiment: Baseline / Graph A / Graph B / Graph C  ✅ built + run
+A four-condition offline experiment testing whether **cross-train** signal (which
+the MTA feed implicitly has and our per-train model doesn't) closes the gap. Every
+graph condition is a **residual correction on model-v2**: `final = v2_pred +
+gnn_residual`, target = `remaining_sec − v2_pred`. Baseline = v2 with residual 0.
+- **`analytics-py/graph_edges.py`** (Phase 1): FOLLOWS canonical spines per
+  route+direction (longest-variant fix — verified load-bearing) and SHARES_TRACK
+  junction zones (longest common contiguous stop-id run, K=4). All six spot-check
+  junctions match exactly (2/3=13, 4/5=7, N/R=28, N/Q=9, A/C=40, B/D=11).
+- **`analytics-py/graph_dataset.py`** (Phase 2): builds one PyG `HeteroData` per
+  30 s snapshot (all active trains as nodes, FOLLOWS + SHARES edges). Design
+  refinement vs. the plan's literal "1.75M ego-subgraphs": one graph per snapshot,
+  and the A/B/C conditions differ purely in the *model* (a 2-layer GNN only sees a
+  2-hop neighborhood, so it *is* the local ego-subgraph) — same ablation, tractable
+  on CPU. Reuses `train_eta.load_v2_instances()` (extracted this session) so node
+  features can't drift from live v2. Temporal expanding-window folds with a
+  1800 s label-horizon gap + trip-purity guard — **verified zero leakage**.
+- **`analytics-py/graph_model.py`** (Phase 3): GraphSAGE + `HeteroConv` (inductive;
+  "drop shares" = Graph A). Graph C adds depth (4 layers) + jumping-knowledge +
+  inter-layer residuals + edge dropout (the standard oversmoothing mitigations).
+  All three overfit a tiny batch to ~0 (sanity check passes).
+- **`analytics-py/graph_experiment.py`** (Phase 4): trains A/B/C on shared folds,
+  grades all four on identical test nodes, paired win-rates + auto verdict, writes
+  `data/exports/graph/experiment_report.json`. **Strictly offline** — verified the
+  live `ledger.db` is untouched (only `data/exports/graph/` is written).
+
+#### The verdict (honest, and it's a real finding)
+On a representative strided sample (400 snapshots across the full ~4–5 day span,
+15,250 test nodes, above the 1000-node gate):
+
+| Condition | short-lead (0–2 min) MAE | vs. previous |
+|---|---|---|
+| Baseline (v2 remaining-time) | 32.8 s | — |
+| **Graph A** (FOLLOWS-only) | **29.6 s** | **PASS** vs baseline (−3.2 s, 55% win) |
+| Graph B (+ SHARES_TRACK) | 29.1 s | ties A (−0.5 s, 51% — no real gain) |
+| Graph C (whole-network, deep) | 29.3 s | ties B (no gain) |
+
+**Reading:** the graph genuinely helps — ~10% short-lead improvement, mostly by
+correcting v2's residual late-bias (baseline +34 s bias at 0–1 min → Graph A
++22 s). But **the entire benefit comes from FOLLOWS (the same-line train ahead)**.
+Adding cross-route junction edges (B) and whole-network deep propagation (C) buy
+essentially nothing — coin-flip win-rates. This is exactly one of the outcomes the
+plan flagged as legitimate: *NYC's same-line headway already carries the cross-train
+signal; cross-route interaction is marginal at this timescale/data volume.*
+- Caveat (stated, not hidden): this is a 4–5 day dataset. n is above the gate and
+  the sample now spans the whole range, so it's a trustworthy **directional** read
+  — but not a ship-grade verdict, which the plan gates on ~2–3 weeks of
+  accumulation. At longer leads (small n) the residual model slightly *hurts*.
+
+**Phase 5 (production Rust sidecar) — deliberately NOT built.** There's a
+directional winner (Graph A), but building a `tch`/libtorch GNN serving sidecar for
+a ~3 s gain from a 4–5 day smoke test would violate the plan's own ship gate. The
+correct, test-first call: re-confirm on accumulated data first. If it holds, the
+thing to ship is **Graph A** (the simplest graph) — not B or C.
+
+### Live graph-structure overlay on the map  ✅ built + verified
+A `Y`-key toggle that draws the actual FOLLOWS/SHARES_TRACK connections between
+currently-visible trains — "how the graph thinks," shipped independently of whether
+the GNN ever wins. Backend loads the Phase-1 topology and computes live edges each
+4 s `pushTick` (FOLLOWS = each train → the next ahead on its line; SHARES = a train
+→ the nearest cross-route train at a shared junction), attached to the existing WS
+`state` broadcast. Frontend renders them as deck.gl `ArcLayer`s (cyan = FOLLOWS,
+orange = SHARES) with hover tooltips.
+- **Verified live:** 666 edges (444 FOLLOWS, 222 SHARES), zero self-loops, FOLLOWS
+  only ever links same-route+direction trains, and **100 % of edge endpoints
+  resolve** to real train positions in the browser.
+
 ---
 
 ## Nice-to-have reconciliation

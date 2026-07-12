@@ -14,6 +14,7 @@ serve-light shape, minus the ONNX intermediary.
 Honest caveat: accuracy is weak until the ledger matures — with a day of data
 most segments are seen once, so this mainly stands up the pipeline.
 """
+import bisect
 import json
 import os
 import sqlite3
@@ -41,7 +42,12 @@ OUT_FEATS_V2 = os.path.join(MODEL_DIR, "eta_features_v2.json")
 # Computed in Python at BOTH train and serve time (see app.py), never stored in
 # the ledger, so train/serve can't drift. Missing -> 0.0 on both sides.
 CAT = ["route_id", "from_stop", "to_stop", "elevation"]
-NUM = ["hour", "dow", "weather_score", "distance_m", "ridership"]
+# alert_active: was there an active MTA service alert for this route around
+# this moment. Same signal build_goldenset.py's alert_active(route, ts) has
+# computed for offline exploration since Phase 6 — promoted here into the
+# live feature list, same "already computed, never wired in" story ridership
+# had before it.
+NUM = ["hour", "dow", "weather_score", "distance_m", "ridership", "alert_active"]
 FEAT_ORDER = CAT + NUM
 
 # model-v2 (the late-bias fix): label = seconds REMAINING in the current hop
@@ -50,20 +56,44 @@ FEAT_ORDER = CAT + NUM
 # log tick mid-hop becomes one (features + frac_hop -> remaining_sec) example.
 # v1 answers "how long is this segment?"; v2 answers "how long is LEFT?".
 CAT_V2 = CAT
-NUM_V2 = ["hour", "dow", "weather_score", "distance_m", "ridership",
+NUM_V2 = ["hour", "dow", "weather_score", "distance_m", "ridership", "alert_active",
           "frac_hop", "kalman_speed", "trains_ahead"]
 FEAT_ORDER_V2 = CAT_V2 + NUM_V2
+
+
+def _load_alert_index(con):
+    """route_id -> sorted list of alerts_log timestamps, loaded once. Mirrors
+    build_goldenset.py's alert_active(route, ts) query (COUNT within a ±200s
+    window) but as an in-memory bisect instead of one SQL round-trip per row
+    — the training sets here run to hundreds of thousands / millions of rows,
+    where per-row queries would dominate runtime; alerts_log itself is small
+    (thousands of rows), so loading it whole is cheap."""
+    idx: dict = {}
+    for route_id, ts in con.execute(
+        "SELECT route_id, ts FROM alerts_log WHERE route_id IS NOT NULL ORDER BY route_id, ts"
+    ):
+        idx.setdefault(route_id, []).append(ts)
+    return idx
+
+
+def _alert_active(alert_index, route_id, ts) -> float:
+    arr = alert_index.get(route_id)
+    if not arr or ts is None:
+        return 0.0
+    i = bisect.bisect_left(arr, ts - 200)
+    return 1.0 if i < len(arr) and arr[i] <= ts + 200 else 0.0
 
 
 def train():
     """Train the ETA model from the segments table; returns (mae, n)."""
     con = sqlite3.connect(LEDGER)
     cur = con.execute(
-        "SELECT route_id, from_stop, to_stop, elevation, hour, dow, weather_score, distance_m, travel_sec "
+        "SELECT route_id, from_stop, to_stop, elevation, hour, dow, weather_score, distance_m, arrive_ts, travel_sec "
         "FROM segments WHERE travel_sec IS NOT NULL"
     )
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    alert_index = _load_alert_index(con)
     con.close()
 
     if not rows:
@@ -85,13 +115,17 @@ def train():
     # afford the blocking fetch; serving (app.py) never blocks on it.
     mta_ridership.ensure_profile()
     ridership_hits = 0
+    alert_hits = 0
     for r in rows:
         b = mta_ridership.busyness(r["to_stop"], r["hour"] or 0, r["dow"] or 0)
         if b is not None:
             ridership_hits += 1
         r["ridership"] = b if b is not None else 0.0
+        r["alert_active"] = _alert_active(alert_index, r["route_id"], r["arrive_ts"])
+        alert_hits += r["alert_active"]
     print(f"[train] ridership coverage: {ridership_hits}/{n} rows "
           f"({mta_ridership.status()['profile_keys']} profile keys)")
+    print(f"[train] alert_active coverage: {int(alert_hits)}/{n} rows had an active alert")
 
     X = np.zeros((n, len(FEAT_ORDER)), dtype=np.float32)
     y = np.zeros(n, dtype=np.float32)
@@ -129,21 +163,25 @@ def train():
     return (round(mae, 1), n)
 
 
-def train_v2():
-    """Train the remaining-time model from vehicle_log x actuals; returns (mae, n).
+def load_v2_instances(con=None):
+    """The v2 training/experiment instance set: each vehicle_log tick (a trip
+    mid-hop at frac_hop, with Kalman speed + congestion) joined to that trip's
+    ground-truth arrival at the hop's to_stop, enriched with the same features
+    v2 trains on. Returns a list of dicts, each carrying every FEAT_ORDER_V2
+    feature plus `ts`, `trip_id`, and the label `remaining_sec`.
 
-    Each vehicle_log tick (trip mid-hop at frac_hop, with Kalman speed +
-    congestion) is joined to that trip's ground-truth arrival at the hop's
-    to_stop; the label is (actual_arrival - log ts) = seconds remaining.
-    Forward-only data: this only grows while the tracker is actually running,
-    so early retrains are honest but thin.
+    SINGLE SOURCE OF TRUTH: train_v2() and the graph experiment (graph_dataset.py)
+    both call this, so the graph's node features and residual baseline can never
+    drift from what v2 was actually trained on. Forward-only data — grows only
+    while the tracker runs.
     """
-    import bisect
     from datetime import datetime
 
-    con = sqlite3.connect(LEDGER)
+    own = con is None
+    if own:
+        con = sqlite3.connect(LEDGER)
     cur = con.execute(
-        "SELECT vl.ts, vl.route AS route_id, vl.from_stop, vl.to_stop, "
+        "SELECT vl.ts, vl.trip_id, vl.route AS route_id, vl.from_stop, vl.to_stop, "
         "       vl.frac_hop, vl.kalman_speed, vl.trains_ahead, "
         "       (a.actual_arrival - vl.ts) AS remaining_sec "
         "FROM vehicle_log vl "
@@ -164,13 +202,13 @@ def train_v2():
     ):
         seg[(f, t)] = (elev, dist)
     wx_rows = con.execute("SELECT ts, weather_score FROM conditions ORDER BY ts").fetchall()
-    con.close()
+    alert_index = _load_alert_index(con)
+    if own:
+        con.close()
     wx_ts = [r[0] for r in wx_rows]
 
     if not rows:
-        print("[train-v2] no vehicle_log x actuals pairs yet — the forward-only "
-              "logger needs runtime; retry after the tracker has run a while.")
-        return (None, 0)
+        return rows
 
     mta_ridership.ensure_profile()
     for r in rows:
@@ -182,10 +220,26 @@ def train_v2():
         r["weather_score"] = wx_rows[i][1] if i >= 0 else None
         b = mta_ridership.busyness(r["to_stop"], r["hour"], r["dow"])
         r["ridership"] = b if b is not None else 0.0
+        r["alert_active"] = _alert_active(alert_index, r["route_id"], r["ts"])
+    return rows
+
+
+def train_v2():
+    """Train the remaining-time model from vehicle_log x actuals; returns (mae, n).
+    Feature loading is shared with the graph experiment via load_v2_instances().
+    """
+    rows = load_v2_instances()
+
+    if not rows:
+        print("[train-v2] no vehicle_log x actuals pairs yet — the forward-only "
+              "logger needs runtime; retry after the tracker has run a while.")
+        return (None, 0)
 
     n = len(rows)
+    alert_hits = sum(r["alert_active"] for r in rows)
     print(f"[train-v2] {n} mid-hop samples "
-          f"(median remaining {sorted(r['remaining_sec'] for r in rows)[n // 2]}s)")
+          f"(median remaining {sorted(r['remaining_sec'] for r in rows)[n // 2]}s, "
+          f"{int(alert_hits)} with an active alert)")
 
     encoders = {c: {v: i for i, v in enumerate(sorted({str(r[c]) for r in rows}))}
                 for c in CAT_V2}

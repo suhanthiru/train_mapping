@@ -38,6 +38,9 @@ export class PredictionLedger {
   private insAccSnap;
   private insVehLog;
   private insAlert;
+  private getWatermark;
+  private setWatermark;
+  private prevActual;
   // in-memory change-detection: "tripId|stopId" -> last logged pred_arrival
   private lastPred = new Map<string, number>();
   // vehicle_log change-detection: tripId -> last {toStop, frac, ahead}
@@ -63,6 +66,15 @@ export class PredictionLedger {
         stop_id        TEXT NOT NULL,
         actual_arrival INTEGER NOT NULL, -- first feed ts we saw STOPPED_AT (upper bound)
         UNIQUE(trip_id, stop_id)
+      );
+      -- supports buildSegments()'s incremental predecessor lookup (trip_id +
+      -- time-ordered scan); the UNIQUE index above is keyed on stop_id, not
+      -- useful for that range query.
+      CREATE INDEX IF NOT EXISTS idx_actuals_trip_ts ON actuals(trip_id, actual_arrival);
+
+      CREATE TABLE IF NOT EXISTS segments_watermark (
+        id                 INTEGER PRIMARY KEY CHECK (id = 1),
+        last_actual_arrival INTEGER NOT NULL DEFAULT 0
       );
 
       CREATE TABLE IF NOT EXISTS conditions (
@@ -157,6 +169,22 @@ export class PredictionLedger {
     );
     this.insAlert = this.db.prepare(
       `INSERT INTO alerts_log (ts, route_id, direction, alert_type, severity, header) VALUES (?, ?, ?, ?, ?, ?)`
+    );
+    this.db.exec(`INSERT OR IGNORE INTO segments_watermark (id, last_actual_arrival) VALUES (1, 0)`);
+    this.getWatermark = this.db.prepare(
+      `SELECT last_actual_arrival FROM segments_watermark WHERE id = 1`
+    );
+    this.setWatermark = this.db.prepare(
+      `UPDATE segments_watermark SET last_actual_arrival = ? WHERE id = 1`
+    );
+    // buildSegments()'s per-row predecessor lookup: the actual immediately
+    // before `b` for the same trip, regardless of whether it's older than the
+    // watermark (already processed) or newly arrived in this same batch —
+    // either way it's already a committed row in `actuals` by the time this
+    // query runs, so lookup order doesn't matter, only insertion order does.
+    this.prevActual = this.db.prepare(
+      `SELECT stop_id, actual_arrival FROM actuals
+       WHERE trip_id = ? AND actual_arrival < ? ORDER BY actual_arrival DESC LIMIT 1`
     );
   }
 
@@ -327,10 +355,21 @@ export class PredictionLedger {
   }
 
   /**
-   * (Re)materialize `segments` from `actuals`: pair each trip's consecutive
-   * observed arrivals into (from_stop -> to_stop) hops with travel time,
-   * enriched with nearest weather + local hour/dow.
-   * Cheap full rebuild — call on a slow timer / on demand. Returns rows written.
+   * Incrementally materialize `segments` from `actuals`: pair each newly-
+   * arrived actual with its trip's immediately-preceding actual into a
+   * (from_stop -> to_stop) hop with travel time, enriched with nearest
+   * weather + local hour/dow. INSERT-only — segments are immutable once a
+   * hop completes, so past rows never need to change.
+   *
+   * Watermark-based: only processes actuals newer than the last run's high
+   * watermark (`segments_watermark`), instead of re-reading and re-deriving
+   * all of `actuals` from scratch every call. The old version did
+   * `DELETE FROM segments` + full rebuild every hour, which meant reprocessing
+   * a table that gets strictly larger every day, forever (the exact
+   * "compounds silently" pattern already fixed once this session in
+   * accuracyByLeadTime()). A fresh ledger starts at watermark 0, so the first
+   * call after this change still does a one-time full pass; every call after
+   * that only touches what's actually new. Returns rows written this call.
    */
   buildSegments(stopPos?: Record<string, [number, number]>, stopElev?: Record<string, string>): number {
     // idempotent column adds (for ledgers created before Phase 2)
@@ -338,9 +377,11 @@ export class PredictionLedger {
       try { this.db.exec(`ALTER TABLE segments ADD COLUMN ${col}`); } catch { /* already exists */ }
     }
 
-    const actuals = this.db
-      .prepare("SELECT trip_id, stop_id, actual_arrival FROM actuals ORDER BY trip_id, actual_arrival")
-      .all() as { trip_id: string; stop_id: string; actual_arrival: number }[];
+    const watermark = (this.getWatermark.get() as { last_actual_arrival: number }).last_actual_arrival;
+    const newActuals = this.db
+      .prepare("SELECT trip_id, stop_id, actual_arrival FROM actuals WHERE actual_arrival > ? ORDER BY actual_arrival")
+      .all(watermark) as { trip_id: string; stop_id: string; actual_arrival: number }[];
+    if (!newActuals.length) return 0;
 
     const wxStmt = this.db.prepare(
       "SELECT weather_score FROM conditions WHERE ts <= ? ORDER BY ts DESC LIMIT 1"
@@ -353,12 +394,14 @@ export class PredictionLedger {
 
     this.db.exec("BEGIN");
     try {
-      this.db.exec("DELETE FROM segments");
       let n = 0;
-      for (let i = 1; i < actuals.length; i++) {
-        const a = actuals[i - 1];
-        const b = actuals[i];
-        if (a.trip_id !== b.trip_id) continue; // segment must be within one trip
+      let maxTs = watermark;
+      for (const b of newActuals) {
+        if (b.actual_arrival > maxTs) maxTs = b.actual_arrival;
+        const a = this.prevActual.get(b.trip_id, b.actual_arrival) as
+          | { stop_id: string; actual_arrival: number }
+          | undefined;
+        if (!a) continue; // first actual seen for this trip — nothing to pair yet
         const travel = b.actual_arrival - a.actual_arrival;
         if (travel < 10 || travel > 1800) continue; // drop bad pairings / long gaps
         // NYC trip_id like "015200_1..N10R" -> route "1"
@@ -377,6 +420,7 @@ export class PredictionLedger {
         );
         n++;
       }
+      this.setWatermark.run(maxTs);
       this.db.exec("COMMIT");
       return n;
     } catch (e) {
@@ -410,6 +454,54 @@ export class PredictionLedger {
       actualsPerHour: one("SELECT COUNT(*) AS c FROM actuals WHERE actual_arrival > ?"),
       vehicleLogPerHour: one("SELECT COUNT(*) AS c FROM vehicle_log WHERE ts > ?"),
     };
+  }
+
+  /**
+   * Hourly write counts across the pipeline's key flows for the trailing
+   * `hours` hours (default 24) — the uptime view: a live/collecting hour has
+   * nonzero feed + vehicleLog; a zero hour means the pipeline wasn't running
+   * or the feed was unreachable, not that trains stopped moving.
+   */
+  hourlyThroughput(hours = 24, now = Math.floor(Date.now() / 1000)): {
+    hourStart: number; feed: number; modelV1: number; modelV2: number; actuals: number; vehicleLog: number;
+  }[] {
+    const since = now - hours * 3600;
+    const bucket = (col: string) => `CAST((${now} - ${col}) / 3600 AS INTEGER)`;
+    const byHour = (sql: string, param: number | string = since) => {
+      const rows = this.db.prepare(sql).all(param) as { h: number; c: number }[];
+      const m = new Map<number, number>();
+      for (const r of rows) m.set(r.h, r.c);
+      return m;
+    };
+    const feed = byHour(
+      `SELECT ${bucket("observed_at")} AS h, COUNT(*) AS c FROM predictions
+       WHERE source='gtfs-rt' AND observed_at > ? GROUP BY h`
+    );
+    const v1 = byHour(
+      `SELECT ${bucket("observed_at")} AS h, COUNT(*) AS c FROM predictions
+       WHERE source='model-v1' AND observed_at > ? GROUP BY h`
+    );
+    const v2 = byHour(
+      `SELECT ${bucket("observed_at")} AS h, COUNT(*) AS c FROM predictions
+       WHERE source='model-v2' AND observed_at > ? GROUP BY h`
+    );
+    const act = byHour(
+      `SELECT ${bucket("actual_arrival")} AS h, COUNT(*) AS c FROM actuals
+       WHERE actual_arrival > ? GROUP BY h`
+    );
+    const vlog = byHour(
+      `SELECT ${bucket("ts")} AS h, COUNT(*) AS c FROM vehicle_log
+       WHERE ts > ? GROUP BY h`
+    );
+    const out = [];
+    for (let h = hours - 1; h >= 0; h--) {
+      out.push({
+        hourStart: now - (h + 1) * 3600,
+        feed: feed.get(h) ?? 0, modelV1: v1.get(h) ?? 0, modelV2: v2.get(h) ?? 0,
+        actuals: act.get(h) ?? 0, vehicleLog: vlog.get(h) ?? 0,
+      });
+    }
+    return out;
   }
 
   /** Row counts for quick verification / status. */

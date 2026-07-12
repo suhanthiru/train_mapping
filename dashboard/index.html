@@ -71,6 +71,12 @@
         <div class="sub">is the pipeline alive right now — feed freshness, write rates, model status</div>
         <div class="cards" id="syshealth"><div class="empty">loading…</div></div>
       </div>
+      <div class="panel jargon" style="grid-column: span 2;">
+        <h2>Uptime — hourly throughput (last 24h)</h2>
+        <div class="sub">feed rows written per hour · a zero hour means the pipeline was down or the feed was unreachable, not that no trains moved</div>
+        <div class="chartbox"><canvas id="throughput"></canvas></div>
+        <div class="sub" id="throughput-summary" style="margin-top:8px;"></div>
+      </div>
       <div class="panel jargon">
         <h2>Ledger</h2>
         <div class="sub">live data collected so far</div>
@@ -92,6 +98,13 @@
         <div class="cards" id="h2h-cards" style="margin-bottom:10px;"></div>
         <div class="chartbox"><canvas id="h2h"></canvas></div>
         <div class="chartbox" style="height:150px;"><canvas id="h2h-bias"></canvas></div>
+      </div>
+      <div class="panel" style="grid-column: span 2;" id="graph-panel">
+        <h2 id="graph-title">Graph GNN experiment — cross-train residual correction</h2>
+        <div class="sub" id="graph-sub">offline A/B/C test: does a GNN using nearby trains (FOLLOWS = same line ahead, SHARES_TRACK = cross-route junction) correct model-v2's error? Each bar = short-lead (0–2 min) MAE; lower is better.</div>
+        <div class="cards" id="graph-cards" style="margin-bottom:10px;"></div>
+        <div class="chartbox" style="height:200px;"><canvas id="graph-mae"></canvas></div>
+        <div id="graph-verdict" class="sub" style="margin-top:10px;"></div>
       </div>
       <div class="panel" style="grid-column: span 2;">
         <h2 id="recent-title">Recent arrivals — estimated ETA vs. actual (ATA)</h2>
