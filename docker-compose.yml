@@ -5,6 +5,13 @@ services:
   kalman-rs:
     build: ./kalman-rs
     ports: ["8092:8092"]
+    # debian-slim has no curl; bash /dev/tcp is a zero-dependency TCP probe
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8092"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   analytics-py:
     build: ./analytics-py
@@ -16,8 +23,23 @@ services:
       - LEDGER_DB=/data/ledger.db
       - MODEL_DIR=/data/models
       - GOLDENSET_DIR=/data/exports/goldenset
+      # Blend down-weighted MTA-history rows into every 6h retrain. Measured
+      # (eval_pretrain.py, 2026-07-12): v1 cold-start MAE -47.6s, overall flat.
+      # Without this the auto-retrain silently unwinds the pretrain win.
+      - PRETRAIN_HISTORY=1
+      - PRETRAIN_WEIGHT=0.3
+      - HISTORY_CACHE_DIR=/data/history_cache
     volumes:
       - ./data:/data
+    # python:3.11-slim has no curl; stdlib urllib is the zero-dependency probe.
+    # /health responds even while models/baselines are still warming (by design
+    # — see app.py), so this gates on "process serving", not "fully warm".
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8091/health', timeout=4).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   backend:
     build:
@@ -27,15 +49,40 @@ services:
     volumes:
       - ./data:/app/data
       - ./web/dist:/app/web/dist:ro
-    depends_on: [kalman-rs, analytics-py]
+    # service_healthy (not just started): backend's first tick calls both deps;
+    # racing ahead of them used to cost a full timeout cascade on cold boots.
+    depends_on:
+      kalman-rs:
+        condition: service_healthy
+      analytics-py:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   analytics-go:
     build: ./analytics-go
     ports: ["8090:8090"]
     volumes:
       - ./data:/data
-    depends_on: [backend, analytics-py]
+    # NOTE: no healthcheck — distroless image has no shell/utilities to exec a
+    # probe with (the Go binary is the only executable). It does expose GET
+    # /health on :8090 for external monitors.
+    depends_on:
+      backend:
+        condition: service_healthy
+      analytics-py:
+        condition: service_healthy
 
   dashboard:
     build: ./dashboard
     ports: ["4174:4174"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4174/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

@@ -49,26 +49,23 @@ MAX_SNAPSHOTS = int(os.environ.get("MAX_SNAPSHOTS", "0")) or None
 # node feature columns (numeric); v2_pred prepended at build time. Deliberately
 # excludes the high-cardinality stop ids — the graph STRUCTURE encodes spatial
 # relationships; these numerics + v2_pred carry the per-node signal.
-NODE_NUM = ["frac_hop", "kalman_speed", "trains_ahead", "hour", "dow",
-            "weather_score", "distance_m", "ridership", "alert_active"]
+# Derived from THE feature registry (shared/features.json, P5): the v2-only
+# numerics first, then the shared numerics — same set v2 trains on.
+import featurize as _fz
+_S = _fz.feature_spec()
+NODE_NUM = list(_S["v2_extra_num"]) + list(_S["num"])
 
 
 def _v2_predict(rows):
     """model-v2's own prediction per instance, via the saved model + encoders —
-    identical to app.py's serving path, so residual targets match live v2."""
+    identical to app.py's serving path (both go through featurize.encode_rows),
+    so residual targets match live v2."""
+    import featurize
     with open(os.path.join(MODEL_DIR, "eta_features_v2.json")) as f:
         feats = json.load(f)
     model = xgb.XGBRegressor()
     model.load_model(os.path.join(MODEL_DIR, "eta_model_v2.json"))
-    enc, order = feats["encoders"], feats["feat_order"]
-    X = np.zeros((len(rows), len(order)), dtype=np.float32)
-    for i, r in enumerate(rows):
-        for j, c in enumerate(order):
-            if c in enc:
-                X[i, j] = enc[c].get(str(r.get(c)), -1)
-            else:
-                v = r.get(c)
-                X[i, j] = float(v) if v is not None else 0.0
+    X = featurize.encode_rows(rows, feats["feat_order"], feats["encoders"])
     return model.predict(X)
 
 

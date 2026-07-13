@@ -8,14 +8,18 @@
 //    cross-port fetches would be mixed-content-blocked, so instead we use
 //    same-origin path prefixes that infra/Caddyfile + infra/nginx.conf proxy
 //    through to each backend (see those files for the matching routes).
+// Ports/colors come from window.TT_CONFIG (dashboard/config.js — GENERATED
+// from shared/config.ts, the single source; regenerate: npm run gen:config).
+const CFG = window.TT_CONFIG ?? { ports: { backend: 8080, kalmanRs: 8092, analyticsPy: 8091, dashboard: 4174 },
+                                  colors: { accent: "#3FD8FF", axis: "#8b98a5", grid: "#1f2937" } };
 const H = location.hostname || "localhost";
 const PROTO = location.protocol === "file:" ? "http:" : location.protocol;
-const directPort = location.port === "4174" || location.protocol === "file:";
-const BACKEND = directPort ? `${PROTO}//${H}:8080` : `${location.origin}/api-backend`;
-const KALMAN = directPort ? `${PROTO}//${H}:8092` : `${location.origin}/api-kalman`;
-const ANALYTICS = directPort ? `${PROTO}//${H}:8091` : `${location.origin}/api-analytics`;
+const directPort = location.port === String(CFG.ports.dashboard) || location.protocol === "file:";
+const BACKEND = directPort ? `${PROTO}//${H}:${CFG.ports.backend}` : `${location.origin}/api-backend`;
+const KALMAN = directPort ? `${PROTO}//${H}:${CFG.ports.kalmanRs}` : `${location.origin}/api-kalman`;
+const ANALYTICS = directPort ? `${PROTO}//${H}:${CFG.ports.analyticsPy}` : `${location.origin}/api-analytics`;
 
-const AX = "#8b98a5", GRID = "#1f2937", ACCENT = "#3FD8FF";
+const AX = CFG.colors.axis, GRID = CFG.colors.grid, ACCENT = CFG.colors.accent;
 Chart.defaults.color = AX;
 Chart.defaults.font.family = "system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
 
@@ -490,10 +494,84 @@ function setPlainMode(on) {
 }
 document.getElementById("mode-plain").onclick = () => setPlainMode(!isSimple());
 
+// ---- P4: anomaly panel + per-route ops row ----
+// Data: BACKEND /api/anomalies {current, recent} (schedule-deviation, cause,
+// alert cross-ref) + /api/prediction-accuracy (model-v2) for the fused row.
+function routeBadge(r) {
+  return `<span style="display:inline-block;min-width:20px;text-align:center;background:${ACCENT};color:#0a0e14;border-radius:10px;padding:1px 7px;font-weight:600;">${r ?? "?"}</span>`;
+}
+
+async function loadAnomalies() {
+  const d = await getJSON(`${BACKEND}/api/anomalies`).catch(() => ({ current: [], recent: [] }));
+  const cur = d.current ?? [];
+  const recent = d.recent ?? [];
+
+  const cards = document.getElementById("anomaly-cards");
+  const routesNow = [...new Set(cur.map((a) => a.route_id))];
+  cards.innerHTML = `
+    <div class="card"><div class="k">active now</div><div class="v" style="color:${cur.length ? "#f0902f" : "#7ed957"}">${cur.length}</div></div>
+    <div class="card"><div class="k">routes affected</div><div class="v">${routesNow.length ? routesNow.join(" ") : "—"}</div></div>
+    <div class="card"><div class="k">episodes (6h)</div><div class="v">${recent.length}</div></div>
+    <div class="card"><div class="k">with known alert</div><div class="v">${cur.filter((a) => a.alert_active).length}/${cur.length}</div></div>`;
+
+  const tbl = document.getElementById("anomaly-table");
+  if (!cur.length) {
+    tbl.innerHTML = `<div class="empty">no trains currently anomalous — checking every 30s${recent.length ? ` · ${recent.length} episode(s) in the last 6h below the fold` : ""}</div>`;
+  } else {
+    const rows = cur
+      .sort((a, b) => (b.deviation_sec ?? 0) - (a.deviation_sec ?? 0))
+      .slice(0, 12)
+      .map((a) => `<tr>
+        <td><a href="${BACKEND}/?trip=${encodeURIComponent(a.id)}" target="_blank" title="show on the live map" style="text-decoration:none">${routeBadge(a.route_id)}</a></td>
+        <td>${a.from_stop} → ${a.to_stop}</td>
+        <td>${fmtDuration(a.observed_sec)} vs ${a.scheduled_sec != null ? fmtDuration(a.scheduled_sec) : "?"} sched</td>
+        <td style="color:#f0902f">+${a.deviation_sec != null ? fmtDuration(a.deviation_sec) : "?"}</td>
+        <td>${a.alert_active ? "🔔 alert active" : "no alert"}</td>
+        <td>${a.likely_cause?.cause ?? "—"}</td>
+      </tr>`).join("");
+    tbl.innerHTML = `<table><tr><th>route</th><th>hop</th><th>observed vs scheduled</th><th>over</th><th>alert?</th><th>likely cause</th></tr>${rows}</table>`;
+  }
+  return { cur, recent };
+}
+
+async function loadOpsRow(anom) {
+  const el = document.getElementById("ops-table");
+  const v2 = await getJSON(`${BACKEND}/api/prediction-accuracy?source=model-v2`).catch(() => ({ buckets: [] }));
+  const v2mae = v2.buckets?.length ? Math.round(v2.buckets.reduce((s, b) => s + (b.mae_sec ?? 0), 0) / v2.buckets.length) : null;
+
+  const byRoute = new Map();
+  for (const a of anom.cur) {
+    const r = byRoute.get(a.route_id) ?? { active: 0, recent: 0, alert: false, cause: null };
+    r.active++; r.alert = r.alert || a.alert_active; r.cause = r.cause ?? a.likely_cause?.cause;
+    byRoute.set(a.route_id, r);
+  }
+  for (const a of anom.recent) {
+    const r = byRoute.get(a.route_id) ?? { active: 0, recent: 0, alert: false, cause: null };
+    r.recent++; r.cause = r.cause ?? a.cause;
+    byRoute.set(a.route_id, r);
+  }
+  if (!byRoute.size) {
+    el.innerHTML = `<div class="empty">all routes nominal · model-v2 avg MAE ${v2mae != null ? fmtDuration(v2mae) : "n/a"}</div>`;
+    return;
+  }
+  const rows = [...byRoute.entries()]
+    .sort((a, b) => b[1].active - a[1].active || b[1].recent - a[1].recent)
+    .map(([route, r]) => `<tr>
+      <td>${routeBadge(route)}</td>
+      <td style="color:${r.active ? "#f0902f" : "#7ed957"}">${r.active} active</td>
+      <td>${r.recent} episode(s) 6h</td>
+      <td>${r.alert ? "🔔 alert" : "—"}</td>
+      <td>${r.cause ?? "—"}</td>
+      <td>${v2mae != null ? "v2 MAE " + fmtDuration(v2mae) : ""}</td>
+    </tr>`).join("");
+  el.innerHTML = `<table><tr><th>route</th><th>now</th><th>history</th><th>alert</th><th>dominant cause</th><th>model</th></tr>${rows}</table>`;
+}
+
 async function refresh() {
   try {
     const d = await loadCounts();
-    await Promise.all([loadPlainSummary(), loadSysHealth(), loadThroughput(), loadKalman(), loadAccuracy(d), loadHeadToHead(), loadGraphExperiment(), loadRecentArrivals(), loadTrend(), loadImportance(), loadFeature()]);
+    const anom = await loadAnomalies();
+    await Promise.all([loadPlainSummary(), loadSysHealth(), loadThroughput(), loadKalman(), loadAccuracy(d), loadHeadToHead(), loadGraphExperiment(), loadRecentArrivals(), loadTrend(), loadImportance(), loadFeature(), loadOpsRow(anom)]);
     document.getElementById("status").textContent = "updated " + new Date().toLocaleTimeString();
   } catch (e) {
     document.getElementById("status").textContent = "error: " + e.message;

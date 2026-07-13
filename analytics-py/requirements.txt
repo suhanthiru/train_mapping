@@ -1,6 +1,8 @@
 # Runtime deps for the FastAPI analytics service (app.py).
 # (The stdlib weather.py / nyc311.py modules need nothing extra.)
-fastapi
-uvicorn
-xgboost
-numpy
+# Pinned to the versions the system was built + verified against (2026-07-12)
+# so container builds and fresh hosts are reproducible.
+fastapi==0.139.0
+uvicorn==0.50.0
+xgboost==3.2.0
+numpy==2.4.6

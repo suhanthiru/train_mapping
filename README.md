@@ -2,12 +2,16 @@
 
 A live, browser-based 3D map that reconstructs real subway/metro trains gliding
 along their actual track geometry, driven by agencies' live GTFS-realtime feeds.
-Rendered as a stylized "model railway at night" diorama with deck.gl.
+Rendered as a stylized "model railway at night" diorama with deck.gl — plus a
+self-improving ETA-prediction stack (XGBoost v1/v2, historical pretraining,
+anomaly detection) graded head-to-head against the official feed.
 
-**Status:** Phase 1 (NYC subway) complete — live ingest → interpolation → 3D render.
+**Status:** NYC subway live end-to-end: ingest → Kalman interpolation → 3D render →
+prediction ledger → auto-retraining models → analytics dashboard → anomaly API.
 Atlanta (MARTA) and Paris (IDFM) planned as additional adapters. See
-[PROJECT_SPEC.md](PROJECT_SPEC.md) for the full design and [NIGHTLY_LOG.md](NIGHTLY_LOG.md)
-for build progress.
+[PROJECT_SPEC.md](PROJECT_SPEC.md) for the design, [docs/architecture.html](docs/architecture.html)
+(served at `/docs/architecture.html`) for the current system diagram, and
+[docs/explainer.html](docs/explainer.html) for the plain-words tour.
 
 ## How it works
 
@@ -49,13 +53,27 @@ npm run preprocess:nyc
 # 3. build the frontend
 cd web && npm run build && cd ..
 
-# 4. start the server (serves the app + live data on :8080)
-npm run server
-# open http://localhost:8080
+# 4. start EVERYTHING with one command (backend, analytics, kalman, dashboard, web dev)
+npm run dev:all
+# then open the service hub: http://localhost:8080/hub
 ```
 
-For frontend live-reload during development: `cd web && npm run dev` (app on :5173),
-with `npm run server` also running for the data/WebSocket.
+`npm run dev:all` starts all five services with name-prefixed joined logs and
+stops the whole tree on Ctrl+C. The **service hub** at
+[localhost:8080/hub](http://localhost:8080/hub) shows a live health dot + link
+for each service — one bookmark instead of five ports:
+
+| Service | Port |
+|---|---|
+| Backend API + 3D map + hub/docs | 8080 |
+| Analytics API (FastAPI, models + anomaly) | 8091 |
+| Kalman sidecar (Rust) | 8092 |
+| Analytics dashboard | 4174 |
+| Web dev server (Vite HMR) | 5173 |
+
+Individual pieces still work standalone (`npm run server`, `python analytics-py/app.py`,
+`node dashboard/serve.mjs`, `cd web && npm run dev`), and `docker compose up` remains
+the production path (see [DEPLOY.md](DEPLOY.md)).
 
 ## Data sources
 

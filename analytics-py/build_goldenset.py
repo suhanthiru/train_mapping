@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 import polars as pl
 
+import alert_index
 import mta_ridership
 
 HERE = os.path.dirname(__file__)
@@ -47,12 +48,12 @@ def main():
         ).fetchone()
         return (r[0], r[1]) if r else (None, None)
 
+    # alert_active via the shared index (P3) — one bisect index instead of one
+    # SQL COUNT round-trip per row; same TRAIN_WINDOW_S the live model trains with.
+    aidx = alert_index.build(con)
+
     def alert_active(route, ts):
-        r = cur.execute(
-            "SELECT COUNT(*) FROM alerts_log WHERE route_id=? AND ts BETWEEN ? AND ?",
-            (route, ts - 200, ts + 200),
-        ).fetchone()
-        return 1 if (r and r[0]) else 0
+        return int(alert_index.active(aidx, route, ts, window=alert_index.TRAIN_WINDOW_S))
 
     # Ridership is NOT a stored per-observation column — it's a static busyness
     # profile keyed on (station, hour, dow). train_eta.py joins it at train time,

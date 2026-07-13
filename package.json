@@ -17,7 +17,10 @@
     "export:all": "tsx history/export.ts all",
     "ingest:nyc": "tsx ingest/nyc.ts",
     "server": "tsx server/index.ts",
-    "dev": "tsx watch server/index.ts"
+    "dev": "tsx watch server/index.ts",
+    "dev:all": "node scripts/dev-all.mjs",
+    "gen:config": "tsx scripts/gen-dashboard-config.mts",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",

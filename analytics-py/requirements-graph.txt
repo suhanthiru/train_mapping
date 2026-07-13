@@ -1,0 +1,8 @@
+# Deps for the OFFLINE graph-ETA experiment only (graph_dataset.py,
+# graph_model.py, graph_experiment.py) — not needed to serve or train the
+# XGBoost models. Was previously undocumented: these imports existed in no
+# requirements file at all, so a fresh host couldn't run the experiment.
+# CPU build is sufficient (the experiment trains small models on snapshots):
+#   pip install -r requirements-graph.txt --index-url https://download.pytorch.org/whl/cpu
+torch==2.12.1
+torch_geometric==2.8.0

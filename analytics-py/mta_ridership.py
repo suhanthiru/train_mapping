@@ -35,11 +35,11 @@ import json
 import os
 import threading
 import time
-import urllib.parse
-import urllib.request
 
-RIDERSHIP_URL = "https://data.ny.gov/resource/5wq4-mkjj.json"
-STATIONS_URL = "https://data.ny.gov/resource/39hk-dx4f.json"
+import socrata
+
+RIDERSHIP_ID = "5wq4-mkjj"
+STATIONS_ID = "39hk-dx4f"
 
 HERE = os.path.dirname(__file__)
 # Resolves to ./data/ridership_profile.json locally AND /data/... in the
@@ -52,7 +52,6 @@ LOOKBACK_DAYS = 56  # ~8 weeks: enough (hour,dow) samples, recent enough for sea
 PROFILE_TTL_SECONDS = 7 * 24 * 3600  # weekly refresh; commute patterns drift slowly
 REFRESH_BACKOFF_SECONDS = 600  # after a failed refresh, don't hammer Socrata
 FETCH_TIMEOUT_SECONDS = 180  # the server-side GROUP BY takes a while (measured: >30s)
-PAGE_LIMIT = 50000
 
 # in-memory: {"ts": epoch, "map": {gtfs_parent: complex}, "profile": {"cx|hr|dw": avg}}
 _state = {"ts": 0, "map": None, "profile": None}
@@ -61,48 +60,40 @@ _refreshing = False
 _last_attempt = 0.0
 
 
-def _get(url, params, timeout=FETCH_TIMEOUT_SECONDS):
-    full = url + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(full, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
+# Fetch/paging live in socrata.py (shared with mta_history). This module keeps
+# its bespoke async-refresh choreography below — busyness() sits on the live
+# /predict path (5s upstream abort), so "stale beats none, never block" is a
+# latency contract the generic cache layer deliberately doesn't absorb.
 
 def _fetch_station_map():
-    rows = _get(STATIONS_URL, {"$select": "gtfs_stop_id,complex_id", "$limit": "2000"})
+    rows = socrata.get(STATIONS_ID, {"$select": "gtfs_stop_id,complex_id", "$limit": "2000"},
+                       timeout=FETCH_TIMEOUT_SECONDS)
     return {r["gtfs_stop_id"]: str(r["complex_id"]) for r in rows
             if r.get("gtfs_stop_id") and r.get("complex_id") is not None}
 
 
 def _fetch_profile():
-    """Bulk (complex, hour, dow) -> avg riders/hour, in <= 2 paged queries."""
+    """Bulk (complex, hour, dow) -> avg riders/hour via the shared paged client."""
     since = time.strftime(
         "%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - LOOKBACK_DAYS * 86400)
     )
     weeks = LOOKBACK_DAYS / 7
+    rows = socrata.get_all(RIDERSHIP_ID, {
+        "$select": ("station_complex_id AS cx,"
+                    "date_extract_hh(transit_timestamp) AS hr,"
+                    "date_extract_dow(transit_timestamp) AS dw,"
+                    "sum(ridership) AS riders"),
+        # transit_mode filter halves the scan (dataset includes tram etc.)
+        "$where": f"transit_timestamp > '{since}' AND transit_mode='subway'",
+        "$group": "cx,hr,dw",
+    }, timeout=FETCH_TIMEOUT_SECONDS)
     profile = {}
-    offset = 0
-    while True:
-        rows = _get(RIDERSHIP_URL, {
-            "$select": ("station_complex_id AS cx,"
-                        "date_extract_hh(transit_timestamp) AS hr,"
-                        "date_extract_dow(transit_timestamp) AS dw,"
-                        "sum(ridership) AS riders"),
-            # transit_mode filter halves the scan (dataset includes tram etc.)
-            "$where": f"transit_timestamp > '{since}' AND transit_mode='subway'",
-            "$group": "cx,hr,dw",
-            "$limit": str(PAGE_LIMIT),
-            "$offset": str(offset),
-        })
-        for r in rows:
-            try:
-                key = f"{r['cx']}|{int(r['hr'])}|{int(r['dw'])}"
-                profile[key] = round(float(r["riders"]) / weeks, 1)
-            except (KeyError, TypeError, ValueError):
-                continue
-        if len(rows) < PAGE_LIMIT:
-            break
-        offset += PAGE_LIMIT
+    for r in rows:
+        try:
+            key = f"{r['cx']}|{int(r['hr'])}|{int(r['dw'])}"
+            profile[key] = round(float(r["riders"]) / weeks, 1)
+        except (KeyError, TypeError, ValueError):
+            continue
     return profile
 
 

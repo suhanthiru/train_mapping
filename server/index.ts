@@ -16,22 +16,22 @@ import { Interpolator, loadStatic } from "../core/interpolate.ts";
 import { haversine } from "../shared/geo.ts";
 import { History } from "../history/db.ts";
 import { PredictionLedger } from "../history/ledger.ts";
+import { PORTS, nodeServiceUrls } from "../shared/config.ts";
+import { postJson, bridgeStatus } from "./bridge.ts";
 import type { VehicleState, RawVehicle } from "../shared/types.ts";
 
-const PORT = Number(process.env.PORT ?? 8080);
+const PORT = Number(process.env.PORT ?? PORTS.backend);
 const POLL_MS = 30_000; // how often we hit the live feed
 const PUSH_MS = 4_000; // how often we re-interpolate + broadcast fresh positions
 const WEATHER_MS = 5 * 60_000; // how often we sample the weather severity scalar
 const ALERTS_MS = 2 * 60_000; // how often we snapshot active service alerts
-// 127.0.0.1, NOT localhost: on Windows, "localhost" resolves IPv6 ::1 first and
-// the services bind IPv4-only, so every fresh connection pays a ~2s fallback —
-// measured live pushing /predict-batch past its 5s abort on every tick (the
-// socket dies before keep-alive can amortize it). Docker overrides via env.
-const ANALYTICS_PY = process.env.ANALYTICS_PY ?? "http://127.0.0.1:8091";
-const KALMAN_RS = process.env.KALMAN_RS ?? "http://127.0.0.1:8092";
+// URLs from shared/config.ts (single source; 127.0.0.1-not-localhost rationale
+// documented there). Docker overrides via env.
+const { analyticsPy: ANALYTICS_PY, kalmanRs: KALMAN_RS } = nodeServiceUrls(process.env);
 const ROOT = process.cwd();
 const DATA_DIR = join(ROOT, "data");
 const WEB_DIST = join(ROOT, "web", "dist");
+const DOCS_DIR = join(ROOT, "docs"); // hub + architecture/explainer info pages
 
 const MIME: Record<string, string> = {
   ".html": "text/html",
@@ -157,6 +157,18 @@ let lastWeatherScore = 0; // reused by modelPredictTick so it doesn't need its o
 // source, no re-derivation.
 interface HopState { fromStop: string; toStop: string; frac: number; speed: number; ahead: number; ts: number }
 const lastHopState = new Map<string, HopState>();
+// P4 anomaly detection: when each trip ENTERED its current hop (elapsed = now -
+// entry.ts), and the latest flagged anomalies (tripId -> scored row) for the
+// /api/anomalies endpoint + the WS anomaly flag on the map.
+interface HopEntry { toStop: string; route: string; ts: number }
+const hopEntry = new Map<string, HopEntry>();
+interface ScoredAnomaly {
+  id: string; route_id: string; from_stop: string; to_stop: string;
+  observed_sec: number; scheduled_sec: number | null; deviation_sec: number | null;
+  is_anomaly: boolean; alert_active: boolean;
+  likely_cause: { cause: string; incidents_per_month: number } | null;
+}
+let currentAnomalies = new Map<string, ScoredAnomaly>();
 let lastFeedOkTs = 0; // epoch s of the last successful feed poll (observability)
 // /api/prediction-accuracy memo (per source) — see the handler for why.
 const accCache = new Map<string, { at: number; body: string }>();
@@ -278,14 +290,11 @@ async function modelPredictTick(raws: RawVehicle[]): Promise<void> {
   if (!hopReqs.length) return;
 
   try {
-    const r = await fetch(`${ANALYTICS_PY}/predict-batch`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(hopReqs),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!r.ok) return; // model not trained yet, or service down — skip quietly
-    const preds = (await r.json()) as { id: string; predicted_travel_sec: number }[];
+    // via the circuit-breaker bridge (P3): a down analytics-py costs one open
+    // circuit instead of a 5s abort on every 30s tick.
+    const preds = await postJson<{ id: string; predicted_travel_sec: number }[]>(
+      `${ANALYTICS_PY}/predict-batch`, hopReqs, { name: "predict-batch" });
+    if (!preds) return; // model not trained / service down / circuit open — skip quietly
     const byId = new Map(preds.map((p) => [p.id, p.predicted_travel_sec]));
 
     const rows: { tripId: string; stopId: string; routeId: string; predArrival: number; observedAt: number }[] = [];
@@ -352,14 +361,9 @@ async function modelV2Tick(
     }
     if (!reqs.length) return;
 
-    const r = await fetch(`${ANALYTICS_PY}/predict-remaining`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(reqs),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!r.ok) return; // v2 not trained yet (needs vehicle_log history) — quiet skip
-    const rem = (await r.json()) as { id: string; remaining_sec: number }[];
+    const rem = await postJson<{ id: string; remaining_sec: number }[]>(
+      `${ANALYTICS_PY}/predict-remaining`, reqs, { name: "predict-remaining" });
+    if (!rem) return; // v2 not trained yet / circuit open — quiet skip
     const remById = new Map(rem.map((p) => [p.id, p.remaining_sec]));
 
     const rows: { tripId: string; stopId: string; routeId: string; predArrival: number; observedAt: number }[] = [];
@@ -395,6 +399,8 @@ async function pushTick() {
   const now = Math.floor(Date.now() / 1000);
   const trains = interp.update(lastRaws, now);
   await applyKalman(trains, now);
+  // P4: flag currently-anomalous trips so the map can highlight them live
+  for (const t of trains) t.anomaly = currentAnomalies.has(t.id.replace(/^nyc:/, "")) || undefined;
   latest = [...trains, ...lastBuses];
   history.record(now, trains);
   logVehicleState(trains, now);
@@ -434,14 +440,67 @@ function logVehicleState(trains: VehicleState[], now: number): void {
         uncertainty: t.uncertainty ?? 0,
         trainsAhead: ahead,
       });
-      lastHopState.set(t.id.replace(/^nyc:/, ""), {
+      const tid = t.id.replace(/^nyc:/, "");
+      lastHopState.set(tid, {
         fromStop: hop.fromStop, toStop: hop.toStop, frac: hop.frac,
         speed: t.speed, ahead, ts: now,
       });
+      // hop-entry tracking (P4 anomaly detection): first tick we see this trip
+      // on this hop = the hop's start; observed_sec = now - entry.
+      const entry = hopEntry.get(tid);
+      if (!entry || entry.toStop !== hop.toStop) {
+        hopEntry.set(tid, { toStop: hop.toStop, route: t.route, ts: now });
+      }
     }
     if (rows.length) ledger.recordVehicleLog(rows);
   } catch (e) {
     console.error("[server] vehicle_log skipped:", (e as Error).message);
+  }
+}
+
+// P4: score in-progress hops against historical schedule baselines
+// (analytics-py /anomaly/hop — deviation vs scheduled hop time, alert
+// cross-reference, likely cause). Only hops slow enough to possibly flag are
+// sent (observed >= 90s; the scorer's floor is ratio 1.5x AND +45s). Flagged
+// episodes persist to anomalies_log; the current set feeds /api/anomalies and
+// the map's anomaly highlight. Goes through the P3 circuit-breaker bridge, so
+// a down analytics-py costs nothing.
+async function anomalyTick(): Promise<void> {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const reqs: { id: string; route_id: string; from_stop: string; to_stop: string; ts: number; observed_sec: number }[] = [];
+    for (const [tid, entry] of hopEntry) {
+      const hs = lastHopState.get(tid);
+      if (!hs || now - hs.ts > 60) { hopEntry.delete(tid); continue; } // trip gone — drop entry
+      const observed = now - entry.ts;
+      if (observed < 90) continue; // can't flag yet (scorer floor) — skip the wire
+      reqs.push({
+        id: tid, route_id: entry.route, from_stop: hs.fromStop,
+        to_stop: hs.toStop, ts: now, observed_sec: observed,
+      });
+    }
+    if (!reqs.length) { currentAnomalies = new Map(); return; }
+
+    const scored = await postJson<ScoredAnomaly[]>(
+      `${ANALYTICS_PY}/anomaly/hop`, reqs, { name: "anomaly-hop" });
+    if (!scored) return; // warming / circuit open — keep previous set
+
+    const next = new Map<string, ScoredAnomaly>();
+    for (const s of scored) if (s.is_anomaly) next.set(s.id, s);
+    currentAnomalies = next;
+
+    if (next.size) {
+      const logged = ledger.recordAnomalies([...next.values()].map((s) => ({
+        ts: now, tripId: s.id, routeId: s.route_id, fromStop: s.from_stop,
+        toStop: s.to_stop, observedSec: Math.round(s.observed_sec),
+        scheduledSec: s.scheduled_sec != null ? Math.round(s.scheduled_sec) : null,
+        deviationSec: s.deviation_sec != null ? Math.round(s.deviation_sec) : null,
+        alertActive: s.alert_active, cause: s.likely_cause?.cause ?? null,
+      })));
+      if (logged) console.log(`[anomaly] ${next.size} active (${logged} new episodes logged)`);
+    }
+  } catch (e) {
+    console.error("[anomaly] tick skipped:", (e as Error).message);
   }
 }
 
@@ -489,7 +548,21 @@ const server = createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
 
   if (url === "/health") {
-    res.writeHead(200).end(JSON.stringify({ ok: true, vehicles: latest.length }));
+    res.writeHead(200).end(JSON.stringify({ ok: true, vehicles: latest.length, bridge: bridgeStatus() }));
+    return;
+  }
+
+  // P4: schedule-deviation anomalies — current flagged trips + recent episode
+  // history (anomalies_log). The dashboard's anomaly panel + ops row read this;
+  // complementary to analytics-go :8090/anomalies (live headway bunching/gaps).
+  if (url === "/api/anomalies") {
+    const current = [...currentAnomalies.values()];
+    let recent: Record<string, unknown>[] = [];
+    try { recent = ledger.recentAnomalies(); }
+    catch (e) { console.error("[anomaly] recent query failed:", (e as Error).message); }
+    res.writeHead(200, { "Content-Type": "application/json" }).end(
+      JSON.stringify({ current, recent })
+    );
     return;
   }
 
@@ -639,16 +712,21 @@ const server = createServer(async (req, res) => {
     return;
   }
 
-  // /data/** -> generated geometry (shapes/stops/routes/…)
-  // /**      -> web/dist build output
+  // /hub + /docs/** -> in-repo info pages (service hub, architecture, explainer)
+  // /data/**        -> generated geometry (shapes/stops/routes/…)
+  // /**             -> web/dist build output
   let filePath: string;
-  if (url.startsWith("/data/")) {
+  if (url === "/hub") {
+    filePath = join(DOCS_DIR, "hub.html");
+  } else if (url.startsWith("/docs/")) {
+    filePath = join(DOCS_DIR, normalize(url.slice("/docs/".length)));
+  } else if (url.startsWith("/data/")) {
     filePath = join(DATA_DIR, normalize(url.slice("/data/".length)));
   } else {
     filePath = join(WEB_DIST, url === "/" ? "index.html" : normalize(url));
   }
   // contain path traversal
-  if (!filePath.startsWith(DATA_DIR) && !filePath.startsWith(WEB_DIST)) {
+  if (!filePath.startsWith(DATA_DIR) && !filePath.startsWith(WEB_DIST) && !filePath.startsWith(DOCS_DIR)) {
     res.writeHead(403).end("forbidden");
     return;
   }
@@ -662,15 +740,80 @@ const server = createServer(async (req, res) => {
 });
 
 // --- WebSocket: push state to viewers ---
+// Two protocols (P5): legacy full-state every tick (default — analytics-go and
+// any older client depend on it), and OPT-IN deltas (`?proto=delta`, used by
+// the web map): full snapshot on connect + every RESYNC_EVERY ticks, compact
+// position tuples in between. Measured: full state ≈ 172 KB per 4s tick
+// (~148 MB/h/client); the delta cuts the steady-state stream ~80%.
 const wss = new WebSocketServer({ server });
-wss.on("connection", (ws: WebSocket) => {
-  // full snapshot on connect (diffing is a later optimization)
+const deltaClients = new WeakSet<WebSocket>();
+wss.on("connection", (ws: WebSocket, req) => {
+  if ((req?.url ?? "").includes("proto=delta")) deltaClients.add(ws);
   ws.send(JSON.stringify({ type: "snapshot", city: "nyc", vehicles: latest }));
 });
 
-function broadcast(msg: unknown) {
-  const data = JSON.stringify(msg);
-  for (const c of wss.clients) if (c.readyState === WebSocket.OPEN) c.send(data);
+// meta-hash per vehicle: when it changes (route/next-stop/shape/color/...),
+// the delta carries the full object for that vehicle instead of a tuple.
+const lastMeta = new Map<string, string>();
+const RESYNC_EVERY = 15; // ~60s: periodic full snapshot to delta clients (drift/miss safety)
+let pushCount = 0;
+
+// nextStopName and stale are deliberately NOT in the hash — nextStop advances
+// constantly as trains progress and stale flips in batches between feed polls
+// (measured: together ~60-130 full objects per tick). Both ride in the tuple:
+// nextStopName in slot 8 (null when unchanged), stale as flags bit 1.
+function metaHash(v: VehicleState): string {
+  return `${v.route}|${v.shapeId ?? ""}|${v.color}|${v.elevation}`;
+}
+const lastNextStop = new Map<string, string>();
+
+/** Compact per-tick tuple: [id, dist, speed, uncertainty, flags, lon, lat,
+ *  nextStopName-if-changed]. flags: bit0=anomaly, bit1=stale.
+ *  (lon/lat only for pos-positioned vehicles/buses.) */
+type DeltaTuple = [string, number | null, number, number | null, number, number | null, number | null, string | null];
+
+function buildDelta(ts: number, graphEdges: unknown) {
+  const up: DeltaTuple[] = [];
+  const meta: VehicleState[] = [];
+  const seen = new Set<string>();
+  for (const v of latest) {
+    seen.add(v.id);
+    const h = metaHash(v);
+    if (lastMeta.get(v.id) !== h) {
+      lastMeta.set(v.id, h);
+      lastNextStop.set(v.id, v.nextStopName ?? "");
+      meta.push(v); // new vehicle or structural change — send full object
+    } else {
+      const ns = v.nextStopName ?? "";
+      const nsChanged = lastNextStop.get(v.id) !== ns;
+      if (nsChanged) lastNextStop.set(v.id, ns);
+      up.push([v.id, v.shapeId ? Math.round(v.dist * 10) / 10 : null,
+               Math.round(v.speed * 100) / 100,
+               v.uncertainty != null ? Math.round(v.uncertainty * 10) / 10 : null,
+               (v.anomaly ? 1 : 0) | (v.stale ? 2 : 0),
+               v.pos ? v.pos[0] : null, v.pos ? v.pos[1] : null,
+               nsChanged ? ns : null]);
+    }
+  }
+  const rm: string[] = [];
+  for (const id of lastMeta.keys()) if (!seen.has(id)) { rm.push(id); lastMeta.delete(id); lastNextStop.delete(id); }
+  return { type: "delta", city: "nyc", ts, up, meta, rm, graphEdges };
+}
+
+function broadcast(msg: { type: string; ts?: number; graphEdges?: unknown; [k: string]: unknown }) {
+  const full = JSON.stringify(msg);
+  pushCount++;
+  const resync = pushCount % RESYNC_EVERY === 0;
+  let delta: string | null = null;
+  for (const c of wss.clients) {
+    if (c.readyState !== WebSocket.OPEN) continue;
+    if (deltaClients.has(c) && msg.type === "state" && !resync) {
+      delta ??= JSON.stringify(buildDelta(msg.ts ?? 0, msg.graphEdges));
+      c.send(delta);
+    } else {
+      c.send(full);
+    }
+  }
 }
 
 server.listen(PORT, () => {
@@ -689,6 +832,9 @@ server.listen(PORT, () => {
   };
   snap();
   setInterval(snap, 10 * 60_000);
+  // Anomaly scoring (P4): every 30s, score in-progress hops against the
+  // historical schedule baselines via analytics-py; persist flagged episodes.
+  setInterval(anomalyTick, 30_000);
   setInterval(() => {
     const removed = history.prune();
     if (removed) console.log(`[server] pruned ${removed} old history rows`);

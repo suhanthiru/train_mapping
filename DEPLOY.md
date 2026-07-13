@@ -62,6 +62,13 @@ docker compose run --rm backend npm run preprocess:osm-layers   # elevation (opt
 docker compose run --rm backend npm run preprocess:osm-match
 ```
 
+**Build the map UI too** — `web/dist` is gitignored and bind-mounted (read-only)
+into the backend, so on a fresh clone the map would be empty without this step.
+No local Node needed — use a throwaway node container writing into `./web`:
+```bash
+docker run --rm -v "$PWD/web":/w -w /w node:24-slim sh -c "npm ci && npm run build"
+```
+
 ## 5. Launch the stack (auto-restarting)
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
@@ -75,6 +82,13 @@ downtime. To kick a first training immediately once some data has accrued:
 ```bash
 curl -X POST http://localhost:8091/retrain
 ```
+
+The compose file sets `PRETRAIN_HISTORY=1`, so every retrain also blends
+down-weighted MTA historical running-time rows (cached under
+`./data/history_cache/`) into training. This is the measured cold-start fix
+(v1 MAE −47.6s on unseen hops, overall flat — `analytics-py/eval_pretrain.py`
+is the gate that proved it). First retrain on a fresh host pulls the history
+from data.ny.gov once (~1-2 min), then serves from the cache.
 
 ## Notes
 - **Data lives in `./data`** on the host (bind-mounted) — it survives container

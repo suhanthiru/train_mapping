@@ -23,6 +23,8 @@ import numpy as np
 import polars as pl
 import xgboost as xgb
 
+import alert_index
+import featurize
 import mta_ridership
 
 HERE = os.path.dirname(__file__)
@@ -36,18 +38,15 @@ OUT_FEATS = os.path.join(MODEL_DIR, "eta_features.json")
 OUT_MODEL_V2 = os.path.join(MODEL_DIR, "eta_model_v2.json")
 OUT_FEATS_V2 = os.path.join(MODEL_DIR, "eta_features_v2.json")
 
-# Phase 4: distance_m + elevation added; dead occ_pct dropped.
-# Ridership: real station busyness (avg riders/hr at the destination station for
-# this hour+dow, from MTA Open Data) — the honest replacement for occupancy.
-# Computed in Python at BOTH train and serve time (see app.py), never stored in
-# the ledger, so train/serve can't drift. Missing -> 0.0 on both sides.
-CAT = ["route_id", "from_stop", "to_stop", "elevation"]
-# alert_active: was there an active MTA service alert for this route around
-# this moment. Same signal build_goldenset.py's alert_active(route, ts) has
-# computed for offline exploration since Phase 6 — promoted here into the
-# live feature list, same "already computed, never wired in" story ridership
-# had before it.
-NUM = ["hour", "dow", "weather_score", "distance_m", "ridership", "alert_active"]
+# Feature lists come from THE registry (shared/features.json via
+# featurize.feature_spec(), roadmap P5) — adding a feature edits the JSON +
+# the producers' enrichment, not five hardcoded lists. Semantics unchanged:
+# ridership = real station busyness (occupancy replacement, computed at BOTH
+# train and serve time so they can't drift, missing -> 0.0); alert_active =
+# service alert near this observation (see alert_index.py).
+_SPEC = featurize.feature_spec()
+CAT = list(_SPEC["cat"])
+NUM = list(_SPEC["num"])
 FEAT_ORDER = CAT + NUM
 
 # model-v2 (the late-bias fix): label = seconds REMAINING in the current hop
@@ -56,32 +55,27 @@ FEAT_ORDER = CAT + NUM
 # log tick mid-hop becomes one (features + frac_hop -> remaining_sec) example.
 # v1 answers "how long is this segment?"; v2 answers "how long is LEFT?".
 CAT_V2 = CAT
-NUM_V2 = ["hour", "dow", "weather_score", "distance_m", "ridership", "alert_active",
-          "frac_hop", "kalman_speed", "trains_ahead"]
+NUM_V2 = NUM + list(_SPEC["v2_extra_num"])
 FEAT_ORDER_V2 = CAT_V2 + NUM_V2
 
-
-def _load_alert_index(con):
-    """route_id -> sorted list of alerts_log timestamps, loaded once. Mirrors
-    build_goldenset.py's alert_active(route, ts) query (COUNT within a ±200s
-    window) but as an in-memory bisect instead of one SQL round-trip per row
-    — the training sets here run to hundreds of thousands / millions of rows,
-    where per-row queries would dominate runtime; alerts_log itself is small
-    (thousands of rows), so loading it whole is cheap."""
-    idx: dict = {}
-    for route_id, ts in con.execute(
-        "SELECT route_id, ts FROM alerts_log WHERE route_id IS NOT NULL ORDER BY route_id, ts"
-    ):
-        idx.setdefault(route_id, []).append(ts)
-    return idx
+# Opt-in historical pretraining (default OFF so the existing behaviour is
+# unchanged). When PRETRAIN_HISTORY=1, train()/train_v2() blend down-weighted
+# synthetic rows from MTA Open Data (build_pretrain.py) with the live ledger to
+# cover cold-start hops, and merge years of Service-Alert history into the
+# alert_active index. Measure-first: eval_pretrain.py decides whether a blended
+# candidate model actually beats the current one before anything is promoted.
+PRETRAIN_HISTORY = os.environ.get("PRETRAIN_HISTORY") == "1"
+PRETRAIN_WEIGHT = float(os.environ.get("PRETRAIN_WEIGHT", "0.3"))  # synthetic vs real=1.0
 
 
-def _alert_active(alert_index, route_id, ts) -> float:
-    arr = alert_index.get(route_id)
-    if not arr or ts is None:
-        return 0.0
-    i = bisect.bisect_left(arr, ts - 200)
-    return 1.0 if i < len(arr) and arr[i] <= ts + 200 else 0.0
+# Alert-active lives in alert_index.py (roadmap P3 — one index, named windows).
+# These thin wrappers keep the historical call sites/signatures stable.
+def _load_alert_index(con, with_history=False):
+    return alert_index.build(con, with_history=with_history)
+
+
+def _alert_active(idx, route_id, ts) -> float:
+    return alert_index.active(idx, route_id, ts, window=alert_index.TRAIN_WINDOW_S)
 
 
 def train():
@@ -93,7 +87,7 @@ def train():
     )
     cols = [d[0] for d in cur.description]
     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-    alert_index = _load_alert_index(con)
+    alert_index = _load_alert_index(con, with_history=PRETRAIN_HISTORY)
     con.close()
 
     if not rows:
@@ -106,13 +100,9 @@ def train():
     print(f"[train] {n} segments · {df['route_id'].n_unique()} routes · "
           f"travel_sec mean={df['travel_sec'].mean():.1f}s")
 
-    # deterministic categorical encoders (saved so serving reproduces features)
-    encoders = {c: {v: i for i, v in enumerate(sorted({str(r[c]) for r in rows}))}
-                for c in CAT}
-
-    # Enrich with station busyness (not a ledger column — computed here from the
-    # cached ridership profile, O(1) per row after one bulk fetch). Training can
-    # afford the blocking fetch; serving (app.py) never blocks on it.
+    # Enrich real rows with station busyness (not a ledger column — computed here
+    # from the cached ridership profile, O(1) per row after one bulk fetch).
+    # Training can afford the blocking fetch; serving (app.py) never blocks on it.
     mta_ridership.ensure_profile()
     ridership_hits = 0
     alert_hits = 0
@@ -127,27 +117,39 @@ def train():
           f"({mta_ridership.status()['profile_keys']} profile keys)")
     print(f"[train] alert_active coverage: {int(alert_hits)}/{n} rows had an active alert")
 
-    X = np.zeros((n, len(FEAT_ORDER)), dtype=np.float32)
-    y = np.zeros(n, dtype=np.float32)
-    for i, r in enumerate(rows):
-        for j, c in enumerate(CAT):
-            X[i, j] = encoders[c].get(str(r[c]), -1)
-        for j, c in enumerate(NUM):
-            v = r[c]
-            X[i, len(CAT) + j] = float(v) if v is not None else 0.0
-        y[i] = float(r["travel_sec"])
+    # Blend down-weighted synthetic history (opt-in). Real rows weight 1.0;
+    # synthetic weight PRETRAIN_WEIGHT so they fill cold-start gaps without
+    # drowning the rich near-term ledger signal.
+    all_rows = rows
+    weights = [1.0] * n
+    if PRETRAIN_HISTORY:
+        import build_pretrain
+        syn, _, st = build_pretrain.load()
+        print(f"[train] pretrain blend: +{len(syn)} synthetic v1 rows "
+              f"(id_align={st['id_align_frac']}, weight={PRETRAIN_WEIGHT})")
+        all_rows = rows + syn
+        weights = weights + [PRETRAIN_WEIGHT] * len(syn)
+
+    # deterministic categorical encoders over the UNION (so synthetic + live
+    # vocabularies align; saved so serving reproduces features). Encoding goes
+    # through featurize.py — the same path app.py serves with, so the two
+    # cannot drift (pinned by tests/test_featurize_parity.py).
+    encoders = featurize.build_encoders(all_rows, CAT)
+    X = featurize.encode_rows(all_rows, FEAT_ORDER, encoders)
+    y = featurize.labels(all_rows, "travel_sec")
+    sw = np.array(weights, dtype=np.float32)
 
     model = xgb.XGBRegressor(
         n_estimators=150, max_depth=4, learning_rate=0.1,
         subsample=0.9, objective="reg:squarederror",
     )
-    model.fit(X, y)
+    model.fit(X, y, sample_weight=sw)
 
-    pred = model.predict(X)
-    mae = float(np.mean(np.abs(pred - y)))
-    base = float(np.mean(np.abs(y - y.mean())))
+    pred = model.predict(X[:n])  # report MAE over REAL rows only (comparable across runs)
+    mae = float(np.mean(np.abs(pred - y[:n])))
+    base = float(np.mean(np.abs(y[:n] - y[:n].mean())))
     print(f"[train] in-sample MAE={mae:.1f}s vs predict-the-mean {base:.1f}s "
-          f"(thin data — improves as the ledger grows)")
+          f"({'+history blend' if PRETRAIN_HISTORY else 'ledger only'})")
 
     model.save_model(OUT_MODEL)
     imp = model.get_booster().get_score(importance_type="gain")
@@ -202,7 +204,7 @@ def load_v2_instances(con=None):
     ):
         seg[(f, t)] = (elev, dist)
     wx_rows = con.execute("SELECT ts, weather_score FROM conditions ORDER BY ts").fetchall()
-    alert_index = _load_alert_index(con)
+    alert_index = _load_alert_index(con, with_history=PRETRAIN_HISTORY)
     if own:
         con.close()
     wx_ts = [r[0] for r in wx_rows]
@@ -241,28 +243,37 @@ def train_v2():
           f"(median remaining {sorted(r['remaining_sec'] for r in rows)[n // 2]}s, "
           f"{int(alert_hits)} with an active alert)")
 
-    encoders = {c: {v: i for i, v in enumerate(sorted({str(r[c]) for r in rows}))}
-                for c in CAT_V2}
-    X = np.zeros((n, len(FEAT_ORDER_V2)), dtype=np.float32)
-    y = np.zeros(n, dtype=np.float32)
-    for i, r in enumerate(rows):
-        for j, c in enumerate(CAT_V2):
-            X[i, j] = encoders[c].get(str(r[c]), -1)
-        for j, c in enumerate(NUM_V2):
-            v = r[c]
-            X[i, len(CAT_V2) + j] = float(v) if v is not None else 0.0
-        y[i] = float(r["remaining_sec"])
+    # Blend down-weighted synthetic mid-hop rows (opt-in). NB: a single subway
+    # hop is ~2 min, so synthetic normal-service rows reinforce near/mid-term;
+    # the truly starved 5-10/10+ min remaining buckets are disruption-driven and
+    # are the anomaly detector's job — measure-first (eval_pretrain.py) verifies
+    # the blend doesn't regress the near-term v2 buckets before promotion.
+    all_rows = rows
+    weights = [1.0] * n
+    if PRETRAIN_HISTORY:
+        import build_pretrain
+        _, syn, st = build_pretrain.load()
+        print(f"[train-v2] pretrain blend: +{len(syn)} synthetic v2 rows "
+              f"(weight={PRETRAIN_WEIGHT})")
+        all_rows = rows + syn
+        weights = weights + [PRETRAIN_WEIGHT] * len(syn)
+
+    encoders = featurize.build_encoders(all_rows, CAT_V2)
+    X = featurize.encode_rows(all_rows, FEAT_ORDER_V2, encoders)
+    y = featurize.labels(all_rows, "remaining_sec")
+    sw = np.array(weights, dtype=np.float32)
 
     model = xgb.XGBRegressor(
         n_estimators=150, max_depth=4, learning_rate=0.1,
         subsample=0.9, objective="reg:squarederror",
     )
-    model.fit(X, y)
+    model.fit(X, y, sample_weight=sw)
 
-    pred = model.predict(X)
-    mae = float(np.mean(np.abs(pred - y)))
-    base = float(np.mean(np.abs(y - y.mean())))
-    print(f"[train-v2] in-sample MAE={mae:.1f}s vs predict-the-mean {base:.1f}s")
+    pred = model.predict(X[:n])  # MAE over REAL rows only (comparable across runs)
+    mae = float(np.mean(np.abs(pred - y[:n])))
+    base = float(np.mean(np.abs(y[:n] - y[:n].mean())))
+    print(f"[train-v2] in-sample MAE={mae:.1f}s vs predict-the-mean {base:.1f}s "
+          f"({'+history blend' if PRETRAIN_HISTORY else 'ledger only'})")
 
     model.save_model(OUT_MODEL_V2)
     imp = model.get_booster().get_score(importance_type="gain")

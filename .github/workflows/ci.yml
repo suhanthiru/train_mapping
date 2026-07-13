@@ -1,0 +1,41 @@
+# Safety net (roadmap P2): every push/PR gets the Python smoke tests, the TS
+# typecheck, and a web build — the three things that catch train/serve drift,
+# type breakage, and the "fresh clone deploys an empty map" failure.
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  python-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r analytics-py/requirements.txt -r analytics-py/requirements-train.txt pytest
+      - run: python -m pytest analytics-py/tests/ -q
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run typecheck
+
+  web-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci
+        working-directory: web
+      - run: npm run build
+        working-directory: web

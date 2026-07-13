@@ -1,11 +1,174 @@
 # Updated Features
 
-Everything added, set up, or reconciled this session. Companion to
-`fixed_errors.md` (which covers bug fixes). Grouped: **explanations** of things
-that already existed but you asked me to walk through, **new** work, and a
-**reconciliation** of the nice-to-have list.
+Everything added, set up, or reconciled. Companion to `fixed_errors.md` (which
+covers bug fixes). Newest session first.
 
 ---
+
+## Session 2026-07-12 — MTA history pretraining, anomaly system, hub + launcher
+
+### MTA Open Data ingestion layer — `analytics-py/mta_history.py`
+Six datasets from data.ny.gov (schemas verified live, Socrata, no keys,
+gzip-cached under `data/history_cache/`): End-to-End Running Times
+(`sp9g-mzjh`), Subway Paths (`tdmq-asac`), Subway Schedules 2026 (`g8es-h7gb`,
+auto-picks the latest Weekday/Sat/Sun service dates so it never goes stale),
+Stations & Complexes structure-type (`5f5g-n3cz`), Service Alerts
+current+historic (`7kct-peq7`+`3h5b-5ktz`, 899k route/ts pairs), Delay-Causing
+Incidents (`g937-7k7c`).
+
+### Historical pretraining — `build_pretrain.py` + `train_eta.py` blend
+Runtimes × paths joined on `stop_path_id`, split into per-hop synthetic
+`travel_sec` rows (18.4k hop-conditions; 99% reuse real ledger geometry;
+98.8% stop-id alignment with the live encoder vocab). Blended into v1/v2
+training behind opt-in `PRETRAIN_HISTORY=1` at weight 0.3, encoders built over
+the union; alert history merged in-memory (never written into the ledger);
+elevation sourced from real structure types instead of the hardcoded default.
+
+### Measure-first gate — `eval_pretrain.py`
+Temporal holdout, current-vs-candidate per lead bucket. **Result: v1 cold-start
+MAE 227.7s → 180.2s (−21%) with overall flat — verdict PROMOTE.** v2 long-lead
+stayed biased (those misses are disruption-driven, not fixable by aggregate
+history) — which is exactly the anomaly detector's job. `--promote` retrains
+the live model files with the blend.
+
+### Anomaly detection — `anomaly.py` + `POST /anomaly/hop` + `POST /anomaly/trip`
+Scores live hops vs scheduled hop-seconds and whole trips vs historical p50/p75
+runtime baselines (distribution-aware, per day-type + time-period);
+cross-references real Service-Alert history (verified against an actual
+2026-05-30 route-2 alert) and attaches the line's dominant delay cause.
+
+### One-command startup + service hub + docs pages
+- `npm run dev:all` (`scripts/dev-all.mjs`, zero new deps): starts kalman-rs,
+  analytics-py, backend, dashboard, and vite together with prefixed logs and
+  tree-kill on Ctrl+C (Windows `taskkill /T`).
+- Service hub at `:8080/hub` — live health dots + links for all five services.
+- Recreated `docs/architecture.html` (current system diagram incl. pretrain +
+  anomaly) and `docs/explainer.html` (plain-words tour), served by the backend.
+- Standing rule going forward: these pages + README get refreshed at the end of
+  every roadmap phase.
+
+### Roadmap Phase 1 — measured quick wins (all verified)
+- **Pretrain made permanent in prod**: `PRETRAIN_HISTORY=1`, `PRETRAIN_WEIGHT`,
+  `HISTORY_CACHE_DIR` wired into `docker-compose.yml` (verified via
+  `docker compose config`) + DEPLOY.md §6 note — the −47.6s cold-start win no
+  longer unwinds on the 6h auto-retrain.
+- **Anomaly hot path ~2000× faster**: `runtime_baseline()` memoized
+  (366ms → 0ms per call; `score_trip` now 0.16ms avg over 100 calls).
+- **Cold-start guard**: anomaly baselines pre-warm in a background thread at
+  startup; `/anomaly/*` returns 503 `{"warming":true}` until ready (verified:
+  cold cache → 503; warm cache → ready in <3s; `anomaly_ready` on `/health`).
+- **3 new ledger indexes** (`actuals(actual_arrival)`, `segments(trip_id)`,
+  `accuracy_snapshots(source,ts)`) — `EXPLAIN QUERY PLAN` confirms the
+  recent-arrivals, trip-history, and accuracy-trend queries all use them now.
+- **Memory leak fixed**: `lastVehLog` entries now carry a timestamp and are
+  pruned on the hourly cycle (6h horizon; skip-path refreshes liveness so
+  active trips never expire).
+
+### Roadmap Phase 5 — deferred optimizations (all measured)
+- **WS delta protocol** (opt-in `?proto=delta`; legacy full-state untouched —
+  analytics-go still consumes it): snapshot on connect + compact per-tick
+  tuples (`[id, dist, speed, uncertainty, flags, lon, lat, nextStop-if-changed]`,
+  flags = anomaly|stale bits) + full objects only on structural change + 60s
+  resync. **Measured live: 153 KB → 34 KB per tick (77% smaller), ~131 → ~36
+  MB/hour/client; dual-client equivalence check: 550 vehicles, 0 mismatches,
+  0.0 m position divergence.** Two hash-churn bugs found & fixed during
+  measurement (nextStopName advancing + stale flipping in poll batches were
+  re-sending full objects).
+- **history.db change-detected writes** with reader-safe playback: rows only on
+  movement (≥2 m / speed Δ≥0.2) + 300s heartbeat + **departure tombstones**
+  (`gone=1` — without them a despawned train ghosted in playback for up to
+  5 min; caught by the equivalence test). `frameAt()` reconstructs
+  latest-state-per-vehicle over the heartbeat window — synthetic-fleet
+  equivalence PASS incl. parked/departed cases; ledger-report's dt≤30s pairing
+  already tolerates sparse rows. **Measured live: 41% fewer rows.**
+- **Feature registry** (`shared/features.json` via `featurize.feature_spec()`):
+  train_eta CAT/NUM/NUM_V2 and graph_dataset NODE_NUM now derive from one
+  JSON (verified byte-identical to the old hardcoded lists — saved models
+  unaffected). Adding a numeric feature = edit the JSON + the enrichment;
+  TS request interfaces stay hand-typed deliberately (compile-time safety).
+
+### Roadmap Phase 4 — anomaly dashboard + ops layer v0 (verified END-TO-END on live data)
+- **Backend anomaly tick** (server/index.ts): tracks when each trip entered its
+  current hop (4s precision), scores all in-progress hops ≥90s against the
+  schedule baselines every 30s via `/anomaly/hop` (through the P3
+  circuit-breaker bridge), keeps the flagged set in memory.
+- **`GET /api/anomalies`** — current flagged trips + recent episodes; new
+  `anomalies_log` ledger table (episode-deduped: one row per trip-hop per
+  10min, 30-day prune).
+- **Dashboard**: "⚠ Anomalies" panel (route badge → map deep-link, observed vs
+  scheduled, overage, alert cross-ref, likely cause) + per-route **ops row**
+  fusing active anomalies, 6h episodes, alerts, dominant cause, and model-v2
+  accuracy.
+- **Map**: flagged trains carry `anomaly: true` over the WS and pulse with an
+  amber halo; `?trip=<id>` deep-links fly to the train.
+- **Live verification** (isolated stack on alt ports, real MTA feed): real
+  anomalies flagged within 3 ticks — e.g. C train A27S→A28S 116s vs 60s
+  scheduled **with a real active alert** (cause: Police & Medical) and an L
+  train +60s (Infrastructure & Equipment); rows landed in `anomalies_log`;
+  WS broadcast carried 15 flagged vehicles; dashboard panel showed **39 active
+  / 14 routes / 33 coinciding with alerts** during a genuine system-wide
+  slowdown. Complementary to analytics-go's existing headway (bunching/gap)
+  anomalies on :8090 — schedule-deviation + cause attribution is the new axis.
+
+### Roadmap Phase 3 — consolidation (tests green throughout; verified live)
+- **`analytics-py/featurize.py`** — THE encoding path. The encoder-build +
+  encode loop existed in 5 copies (train v1, train v2, eval, graph experiment,
+  serving); all now call `build_encoders`/`encode_rows`/`labels`. Policy pinned
+  by the parity tests: categorical iff in encoders, unseen → −1, missing
+  numeric → 0.0.
+- **`analytics-py/socrata.py`** — THE data.ny.gov client (get / paged get_all /
+  probe / locked gzip-disk cache). `mta_history` migrated fully;
+  `mta_ridership` uses the shared fetch/paging but keeps its bespoke
+  async-refresh serving path (documented latency contract).
+- **`analytics-py/alert_index.py`** — THE alert-active signal. Previously 4
+  variants with 3 windows; now one bisect index with named windows
+  (`TRAIN_WINDOW_S=200`, `ANOMALY_WINDOW_S=1800`, `LIVE_WINDOW_S=300`) and all
+  four call sites migrated (train_eta, anomaly, build_goldenset — which also
+  went from one SQL COUNT per row to O(log n) bisect — and active_alerts).
+- **`shared/config.ts`** — THE ports/colors/id-parsing/timezone constants.
+  Consumed by server/index.ts, ledger.ts, web/src/main.ts; dashboard gets a
+  GENERATED `dashboard/config.js` (`npm run gen:config`) since it has no build
+  step. NYC trip-id parsing now has exactly one definition.
+- **`server/bridge.ts`** — model-bridge client with timeout + one quick retry +
+  per-endpoint circuit breaker (OPEN after 3 consecutive failures → fail-fast,
+  half-open probe every 60s). **Verified live**: pointed a test instance at a
+  dead port → "circuit OPEN after 3 consecutive failures" and /health shows
+  `bridge:{predict-batch:{open:true}}`; brought a mock service up → "circuit
+  closed (probe succeeded)". A down analytics-py now costs ~nothing per tick
+  instead of 5s+5s aborts.
+
+### Roadmap Phase 2 — safety net (all verified locally)
+- **First tests ever**: `analytics-py/tests/` — 15 pytest cases covering
+  train-vs-serve featurize parity (bit-identical rows, unseen-category and
+  missing-value policies), the anomaly scorer on canned baselines, and the
+  eval-promotion verdict. Hermetic (no network; `ANOMALY_WARM=0` guard added
+  to app.py so importing it in tests spawns no threads).
+- **The suite immediately caught a real bug**: `_verdict` let a long-lead win
+  outvote a near-term regression block (ordering flaw) — a regressing model
+  could have been promoted. Fixed: blocks are now vetoes. (Today's real
+  PROMOTE verdict was unaffected — that run had no regression.)
+- **Typecheck**: `npm run typecheck` (`tsc --noEmit`) — tsconfig needed
+  `allowImportingTsExtensions`; whole TS codebase checks clean.
+- **CI**: `.github/workflows/ci.yml` — pytest + typecheck + web build on every
+  push/PR.
+- **Pinned deps**: `requirements*.txt` now carry exact verified versions; new
+  `requirements-graph.txt` documents torch/torch_geometric (previously in no
+  requirements file at all).
+- **Container healthchecks** on 4 of 5 services with zero-dependency probes
+  (bash /dev/tcp for debian-slim, stdlib urllib for python-slim, node fetch
+  for node-slim; analytics-go is distroless — no shell to probe with, exposes
+  /health for external monitors) + `depends_on: service_healthy` so cold boots
+  stop racing. Both compose files validate merged.
+- **DEPLOY.md**: added the missing web-UI build step (fresh clone previously
+  deployed an empty map) via a throwaway node container — still no local Node
+  needed.
+
+---
+
+# Session 2026-07-09 (earlier)
+
+Grouped: **explanations** of things that already existed but you asked me to
+walk through, **new** work, and a **reconciliation** of the nice-to-have list.
 
 ## Explanations (already built — how they work)
 

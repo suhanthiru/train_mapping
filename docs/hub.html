@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Train Tracker — Service Hub</title>
+<style>
+  :root { --bg:#0b0f14; --card:#121821; --line:#1f2937; --fg:#e5eef7; --dim:#8aa0b4;
+          --cyan:#3FD8FF; --amber:#F0A830; --green:#34d399; --red:#f87171; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--fg); font:15px/1.5 system-ui,Segoe UI,sans-serif; padding:32px 20px; }
+  .wrap { max-width:880px; margin:0 auto; }
+  h1 { font-size:22px; letter-spacing:.3px; }
+  h1 span { color:var(--cyan); }
+  p.sub { color:var(--dim); margin:6px 0 24px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; }
+  .card h2 { font-size:15px; display:flex; align-items:center; gap:8px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:var(--dim); flex:none;
+         box-shadow:0 0 6px transparent; transition:background .3s; }
+  .dot.up   { background:var(--green); box-shadow:0 0 8px var(--green); }
+  .dot.down { background:var(--red); }
+  .card .port { color:var(--dim); font-size:12px; margin-left:auto; font-family:ui-monospace,monospace; }
+  .card p { color:var(--dim); font-size:13px; margin:8px 0 10px; }
+  .card a { color:var(--cyan); text-decoration:none; font-size:13px; margin-right:12px; }
+  .card a:hover { text-decoration:underline; }
+  .meta { color:var(--dim); font-size:12px; margin-top:26px; border-top:1px solid var(--line); padding-top:12px; }
+  .meta code { color:var(--amber); font-family:ui-monospace,monospace; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Train <span>Tracker</span> — Service Hub</h1>
+  <p class="sub">Every service, one page. Green dot = responding. Start everything with one command: <code style="color:var(--amber)">npm run dev:all</code></p>
+
+  <div class="grid">
+    <div class="card">
+      <h2><span class="dot" data-probe="http://localhost:8080/health" data-samesite="1"></span>Live Map (3D) <span class="port">:8080</span></h2>
+      <p>deck.gl subway + bus map served by the backend (prod build). Trains, elevation toggle, arrivals board.</p>
+      <a href="http://localhost:8080/" target="_blank">open map</a>
+      <a href="http://localhost:8080/health" target="_blank">health</a>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot" data-probe="http://localhost:5173/"></span>Web Dev (HMR) <span class="port">:5173</span></h2>
+      <p>Vite dev server for the map UI — hot reload while editing <code>web/src</code>. Only up in dev.</p>
+      <a href="http://localhost:5173/" target="_blank">open dev UI</a>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot" data-probe="http://localhost:4174/"></span>Analytics Dashboard <span class="port">:4174</span></h2>
+      <p>Chart.js dashboard: live <b style="color:var(--amber)">anomaly panel</b> + per-route ops row, model-vs-feed accuracy, drill-downs.</p>
+      <a href="http://localhost:4174/" target="_blank">open dashboard</a>
+      <a href="http://localhost:8080/api/anomalies" target="_blank">anomalies API</a>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot" data-probe="http://localhost:8091/health"></span>Analytics API (Python) <span class="port">:8091</span></h2>
+      <p>FastAPI: ETA models v1/v2, 6h auto-retrain, ridership/weather context, anomaly scoring.</p>
+      <a href="http://localhost:8091/docs" target="_blank">API docs</a>
+      <a href="http://localhost:8091/health" target="_blank">health</a>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot" data-probe="http://localhost:8092/health"></span>Kalman Sidecar (Rust) <span class="port">:8092</span></h2>
+      <p>Position/uncertainty filter — the backend batches every train through <code>POST /filter</code> each 4s tick.</p>
+      <a href="http://localhost:8092/health" target="_blank">health</a>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot" data-probe="http://localhost:8080/api/system-health" data-samesite="1"></span>Backend API <span class="port">:8080</span></h2>
+      <p>Ingest, interpolation, WebSocket push, prediction ledger, accuracy endpoints.</p>
+      <a href="http://localhost:8080/api/system-health" target="_blank">system health</a>
+      <a href="http://localhost:8080/api/prediction-accuracy" target="_blank">accuracy</a>
+    </div>
+
+    <div class="card">
+      <h2><span class="dot up"></span>Docs</h2>
+      <p>How the system fits together, and what everything means in plain words.</p>
+      <a href="/docs/architecture.html">architecture</a>
+      <a href="/docs/explainer.html">explainer</a>
+    </div>
+  </div>
+
+  <p class="meta">
+    Ports: backend <code>8080</code> · analytics-py <code>8091</code> · kalman-rs <code>8092</code> · dashboard <code>4174</code> · vite <code>5173</code>.
+    Prod: <code>docker compose up</code> (see DEPLOY.md). Dev: <code>npm run dev:all</code> starts all five with joined logs; Ctrl+C stops the whole tree.
+  </p>
+</div>
+<script>
+  // Health dots. Same-site probes read the real response; cross-origin ones use
+  // no-cors — an opaque response still proves the service answered.
+  async function probe(el) {
+    const url = el.dataset.probe;
+    if (!url) return;
+    try {
+      if (el.dataset.samesite) {
+        const r = await fetch(url, { cache: "no-store" });
+        el.classList.toggle("up", r.ok);
+        el.classList.toggle("down", !r.ok);
+      } else {
+        await fetch(url, { mode: "no-cors", cache: "no-store" });
+        el.classList.add("up"); el.classList.remove("down");
+      }
+    } catch {
+      el.classList.add("down"); el.classList.remove("up");
+    }
+  }
+  function sweep() { document.querySelectorAll(".dot[data-probe]").forEach(probe); }
+  sweep();
+  setInterval(sweep, 5000);
+</script>
+</body>
+</html>

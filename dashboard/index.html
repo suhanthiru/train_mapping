@@ -87,6 +87,17 @@
         <div class="sub">present-state estimator · vs the 5.72 m/s clamp baseline</div>
         <div class="cards" id="kalman"></div>
       </div>
+      <div class="panel" style="grid-column: span 2;" id="anomaly-panel">
+        <h2>⚠ Anomalies — trains running abnormally slow right now</h2>
+        <div class="sub">live schedule-deviation detection: observed hop time vs the MTA schedule + historical baselines · cross-referenced against service alerts · likely cause from 6 years of delay-incident data</div>
+        <div class="cards" id="anomaly-cards" style="margin-bottom:10px;"></div>
+        <div id="anomaly-table"><div class="empty">no anomalies detected — checking every 30s</div></div>
+      </div>
+      <div class="panel jargon" style="grid-column: span 2;" id="ops-panel">
+        <h2>Ops row — per-route situation</h2>
+        <div class="sub">one row per route: active anomalies + recent episodes (6h) + model-v2 accuracy — the fused operational view</div>
+        <div id="ops-table"><div class="empty">loading…</div></div>
+      </div>
       <div class="panel jargon">
         <h2>Feed ETA accuracy (MAE by lead time)</h2>
         <div class="sub">how far off the agency feed's arrival predictions are · rolling last 6h (full history: npm run report:backtest)</div>
@@ -160,6 +171,7 @@
   </section>
 </main>
 
+<script src="./config.js"></script>
 <script src="./app.js"></script>
 </body>
 </html>

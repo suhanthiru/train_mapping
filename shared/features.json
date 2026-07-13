@@ -1,0 +1,15 @@
+{
+  "_doc": [
+    "THE model feature registry (roadmap P5). Order matters: it defines the",
+    "saved models' feature order. Consumed by analytics-py/featurize.py",
+    "(feature_spec()), which train_eta.py (CAT/NUM/NUM_V2) and",
+    "graph_dataset.py (NODE_NUM) derive from — adding a numeric feature is:",
+    "(1) add it here, (2) provide its value in the producers' enrichment",
+    "(train_eta load paths, server request types if live-served).",
+    "TS request interfaces (server/index.ts, app.py pydantic models) stay",
+    "hand-typed on purpose — compile-time safety over registry magic."
+  ],
+  "cat": ["route_id", "from_stop", "to_stop", "elevation"],
+  "num": ["hour", "dow", "weather_score", "distance_m", "ridership", "alert_active"],
+  "v2_extra_num": ["frac_hop", "kalman_speed", "trains_ahead"]
+}

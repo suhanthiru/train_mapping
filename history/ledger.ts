@@ -13,6 +13,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { RawVehicle } from "../shared/types.ts";
 import { haversine } from "../shared/geo.ts";
+import { routeFromTripId } from "../shared/config.ts";
 
 // 30-day retention (longer than history.db's 7d) — this data trains the ETA
 // model AND backs graph analytics, and more history means a better model.
@@ -38,13 +39,19 @@ export class PredictionLedger {
   private insAccSnap;
   private insVehLog;
   private insAlert;
+  private insAnomaly;
   private getWatermark;
   private setWatermark;
   private prevActual;
   // in-memory change-detection: "tripId|stopId" -> last logged pred_arrival
   private lastPred = new Map<string, number>();
-  // vehicle_log change-detection: tripId -> last {toStop, frac, ahead}
-  private lastVehLog = new Map<string, { toStop: string; frac: number; ahead: number }>();
+  // vehicle_log change-detection: tripId -> last {toStop, frac, ahead, ts}.
+  // ts lets prune() forget finished trips — without it this map grew by every
+  // distinct trip_id ever seen (a slow leak on an always-on host).
+  private lastVehLog = new Map<string, { toStop: string; frac: number; ahead: number; ts: number }>();
+  // anomalies_log episode-detection: "tripId|toStop" -> last logged ts. A slow
+  // trip stays slow for many ticks — log one row per episode, not per tick.
+  private lastAnomaly = new Map<string, number>();
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -71,6 +78,10 @@ export class PredictionLedger {
       -- time-ordered scan); the UNIQUE index above is keyed on stop_id, not
       -- useful for that range query.
       CREATE INDEX IF NOT EXISTS idx_actuals_trip_ts ON actuals(trip_id, actual_arrival);
+      -- supports recentArrivalComparisons' ORDER BY actual_arrival DESC LIMIT
+      -- (polled every 15s by the dashboard — was a full sort as actuals grew)
+      -- and prune()'s cutoff scan.
+      CREATE INDEX IF NOT EXISTS idx_actuals_arrival ON actuals(actual_arrival);
 
       CREATE TABLE IF NOT EXISTS segments_watermark (
         id                 INTEGER PRIMARY KEY CHECK (id = 1),
@@ -133,6 +144,8 @@ export class PredictionLedger {
       CREATE INDEX IF NOT EXISTS idx_seg_route ON segments(route_id);
       CREATE INDEX IF NOT EXISTS idx_seg_stops ON segments(from_stop, to_stop);
       CREATE INDEX IF NOT EXISTS idx_seg_arrive ON segments(arrive_ts);
+      -- supports tripHistory()'s per-trip drill-down (was a full table scan)
+      CREATE INDEX IF NOT EXISTS idx_seg_trip ON segments(trip_id);
 
       -- Periodic accuracy snapshots so the dashboard can trend accuracy over
       -- time (one row per lead-time bucket per snapshot per source).
@@ -145,6 +158,27 @@ export class PredictionLedger {
         bias_sec   INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_accsnap_ts ON accuracy_snapshots(ts);
+      -- supports accuracyTrend()'s per-source scan + sort (dashboard polling)
+      CREATE INDEX IF NOT EXISTS idx_accsnap_source ON accuracy_snapshots(source, ts);
+
+      -- Schedule-deviation anomalies (roadmap P4): one row per flagged
+      -- observation from analytics-py's /anomaly/hop — history for the
+      -- dashboard's incident review. Complementary to analytics-go's live
+      -- headway (bunching/gap) anomalies, which are streaming-only.
+      CREATE TABLE IF NOT EXISTS anomalies_log (
+        ts            INTEGER NOT NULL,
+        trip_id       TEXT NOT NULL,
+        route_id      TEXT,
+        from_stop     TEXT,
+        to_stop       TEXT,
+        observed_sec  INTEGER,
+        scheduled_sec INTEGER,
+        deviation_sec INTEGER,
+        alert_active  INTEGER,  -- 0/1: coincided with a known service alert
+        cause         TEXT      -- dominant delay-cause category for the line
+      );
+      CREATE INDEX IF NOT EXISTS idx_anom_ts ON anomalies_log(ts);
+      CREATE INDEX IF NOT EXISTS idx_anom_route ON anomalies_log(route_id, ts);
     `);
     this.insPred = this.db.prepare(
       `INSERT INTO predictions (trip_id, stop_id, route_id, pred_arrival, observed_at)
@@ -170,6 +204,10 @@ export class PredictionLedger {
     this.insAlert = this.db.prepare(
       `INSERT INTO alerts_log (ts, route_id, direction, alert_type, severity, header) VALUES (?, ?, ?, ?, ?, ?)`
     );
+    this.insAnomaly = this.db.prepare(
+      `INSERT INTO anomalies_log (ts, trip_id, route_id, from_stop, to_stop, observed_sec, scheduled_sec, deviation_sec, alert_active, cause)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
     this.db.exec(`INSERT OR IGNORE INTO segments_watermark (id, last_actual_arrival) VALUES (1, 0)`);
     this.getWatermark = this.db.prepare(
       `SELECT last_actual_arrival FROM segments_watermark WHERE id = 1`
@@ -186,6 +224,48 @@ export class PredictionLedger {
       `SELECT stop_id, actual_arrival FROM actuals
        WHERE trip_id = ? AND actual_arrival < ? ORDER BY actual_arrival DESC LIMIT 1`
     );
+  }
+
+  /** Persist flagged schedule-deviation anomalies (P4). One row per episode:
+   *  a (trip, hop) re-logs only after REANOMALY_GAP_S of silence, so a train
+   *  that stays slow for 10 ticks yields one review row, not ten. */
+  recordAnomalies(rows: {
+    ts: number; tripId: string; routeId: string | null; fromStop: string | null;
+    toStop: string | null; observedSec: number | null; scheduledSec: number | null;
+    deviationSec: number | null; alertActive: boolean; cause: string | null;
+  }[]): number {
+    const REANOMALY_GAP_S = 600;
+    let logged = 0;
+    this.db.exec("BEGIN");
+    try {
+      for (const r of rows) {
+        const key = `${r.tripId}|${r.toStop ?? ""}`;
+        const last = this.lastAnomaly.get(key);
+        if (last != null && r.ts - last < REANOMALY_GAP_S) continue;
+        this.lastAnomaly.set(key, r.ts);
+        this.insAnomaly.run(
+          r.ts, r.tripId, r.routeId, r.fromStop, r.toStop,
+          r.observedSec, r.scheduledSec, r.deviationSec,
+          r.alertActive ? 1 : 0, r.cause
+        );
+        logged++;
+      }
+      this.db.exec("COMMIT");
+    } catch (e) {
+      this.db.exec("ROLLBACK");
+      throw e;
+    }
+    return logged;
+  }
+
+  /** Recent flagged anomalies for the dashboard's incident-review panel. */
+  recentAnomalies(sinceSeconds = 6 * 3600, limit = 200): Record<string, unknown>[] {
+    const since = Math.floor(Date.now() / 1000) - sinceSeconds;
+    return this.db.prepare(
+      `SELECT ts, trip_id, route_id, from_stop, to_stop, observed_sec,
+              scheduled_sec, deviation_sec, alert_active, cause
+       FROM anomalies_log WHERE ts > ? ORDER BY ts DESC LIMIT ?`
+    ).all(since, limit) as Record<string, unknown>[];
   }
 
   /** Log the feed's evolving arrival predictions (change-detected, bitemporal). */
@@ -273,9 +353,10 @@ export class PredictionLedger {
       for (const r of rows) {
         const prev = this.lastVehLog.get(r.tripId);
         if (prev && prev.toStop === r.toStop && Math.abs(prev.frac - r.fracHop) < 0.1 && prev.ahead === r.trainsAhead) {
+          prev.ts = r.ts; // still alive — keep it from expiring in prune()
           continue; // no material change — skip
         }
-        this.lastVehLog.set(r.tripId, { toStop: r.toStop, frac: r.fracHop, ahead: r.trainsAhead });
+        this.lastVehLog.set(r.tripId, { toStop: r.toStop, frac: r.fracHop, ahead: r.trainsAhead, ts: r.ts });
         this.insVehLog.run(r.ts, r.tripId, r.route, r.fromStop, r.toStop, r.fracHop, r.kalmanSpeed, r.uncertainty, r.trainsAhead);
       }
       this.db.exec("COMMIT");
@@ -404,8 +485,8 @@ export class PredictionLedger {
         if (!a) continue; // first actual seen for this trip — nothing to pair yet
         const travel = b.actual_arrival - a.actual_arrival;
         if (travel < 10 || travel > 1800) continue; // drop bad pairings / long gaps
-        // NYC trip_id like "015200_1..N10R" -> route "1"
-        const routeId = b.trip_id.split("_")[1]?.split("..")[0] ?? null;
+        // NYC trip_id like "015200_1..N10R" -> route "1" (shared/config.ts)
+        const routeId = routeFromTripId(b.trip_id);
         const wx = wxStmt.get(b.actual_arrival) as { weather_score: number } | undefined;
         const d = new Date(b.actual_arrival * 1000); // local tz (assumed ET on the host)
         const pf = stopPos?.[a.stop_id];
@@ -440,8 +521,15 @@ export class PredictionLedger {
     removed += Number(this.db.prepare("DELETE FROM accuracy_snapshots WHERE ts < ?").run(cutoff).changes ?? 0);
     removed += Number(this.db.prepare("DELETE FROM vehicle_log WHERE ts < ?").run(cutoff).changes ?? 0);
     removed += Number(this.db.prepare("DELETE FROM alerts_log WHERE ts < ?").run(cutoff).changes ?? 0);
+    removed += Number(this.db.prepare("DELETE FROM anomalies_log WHERE ts < ?").run(cutoff).changes ?? 0);
     // forget stale change-detection keys so the maps don't grow unbounded
     for (const [k, t] of this.lastPred) if (t < cutoff) this.lastPred.delete(k);
+    // lastVehLog gets a much tighter horizon than the 30d DB cutoff: a trip
+    // lives hours, and every distinct trip_id ever seen was previously kept
+    // forever (the slow leak). 6h comfortably covers any live trip.
+    const vehCutoff = now - 6 * 3600;
+    for (const [k, v] of this.lastVehLog) if (v.ts < vehCutoff) this.lastVehLog.delete(k);
+    for (const [k, t] of this.lastAnomaly) if (t < vehCutoff) this.lastAnomaly.delete(k);
     return removed;
   }
 

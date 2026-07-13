@@ -10,23 +10,25 @@ import { SimpleMeshLayer } from "@deck.gl/mesh-layers";
 import type { PickingInfo } from "@deck.gl/core";
 import { distToLonLat, bearingAt, type Shape } from "./geo.ts";
 import { trainCarMesh, busMesh } from "./mesh.ts";
+import { PORTS, routeFromShapeId } from "../../shared/config.ts";
 
-// Same-origin by default — this bundle is served BY the backend on :8080, so
-// same-origin naturally follows the page wherever it's reached from (direct
-// :8080, or a TLS-terminating reverse proxy on 80/443 with no port at all).
-// Explicit :8080 is used ONLY under `vite dev` (:5173), which has no dev proxy
+// Same-origin by default — this bundle is served BY the backend, so same-origin
+// naturally follows the page wherever it's reached from (direct port, or a
+// TLS-terminating reverse proxy on 80/443 with no port at all). The explicit
+// backend port is used ONLY under `vite dev`, which has no dev proxy
 // configured, so the API has to be reached across ports there.
+// Ports come from shared/config.ts — the single source (roadmap P3).
 const HOST = location.hostname || "localhost";
-const onViteDev = location.port === "5173";
+const onViteDev = location.port === String(PORTS.webDev);
 const HTTP_PROTO = location.protocol === "https:" ? "https:" : "http:";
 const WS_PROTO = location.protocol === "https:" ? "wss:" : "ws:";
-const HTTP = onViteDev ? `${HTTP_PROTO}//${HOST}:8080` : `${HTTP_PROTO}//${location.host}`;
-const WS = onViteDev ? `${WS_PROTO}//${HOST}:8080` : `${WS_PROTO}//${location.host}`;
-// Go streaming-analytics service (separate microservice, :8090) is never
-// same-origin with anything — reachable only where its port is exposed
-// (local dev, or a VPS with :8090 open). Behind a TLS proxy that doesn't
-// forward it, this degrades gracefully: the anomalies panel just shows nothing.
-const ANALYTICS = `${HTTP_PROTO}//${HOST}:8090`;
+const HTTP = onViteDev ? `${HTTP_PROTO}//${HOST}:${PORTS.backend}` : `${HTTP_PROTO}//${location.host}`;
+const WS = onViteDev ? `${WS_PROTO}//${HOST}:${PORTS.backend}` : `${WS_PROTO}//${location.host}`;
+// Go streaming-analytics service (separate microservice) is never same-origin
+// with anything — reachable only where its port is exposed (local dev, or a
+// VPS with the port open). Behind a TLS proxy that doesn't forward it, this
+// degrades gracefully: the anomalies panel just shows nothing.
+const ANALYTICS = `${HTTP_PROTO}//${HOST}:${PORTS.analyticsGo}`;
 const SPEED_BOOST = 1.0; // real rate — no overshoot, so no snap-back/reversing
 
 interface RouteInfo { id: string; color: string; textColor: string; shortName: string }
@@ -40,6 +42,7 @@ interface Vehicle {
   position: [number, number, number]; angle: number;
   elevation: Elevation;
   uncertainty?: number; // √variance (m) from the Kalman sidecar; drives the K halo
+  anomaly?: boolean; // P4: flagged as running anomalously slow vs schedule (amber pulse)
 }
 
 const hex2rgb = (h: string): [number, number, number] => {
@@ -94,6 +97,9 @@ let showUncertainty = false; // K: Kalman position-uncertainty halos (default of
 let showGraph = false; // Y: graph overlay — FOLLOWS + SHARES_TRACK edges between trains
 let statBase = "connecting…";
 let fpsCount = 0, fpsLast = performance.now(), fpsVal = 0;
+// P4 deep-link from the dashboard's anomaly panel: /?trip=<tripId> flies to
+// that train when it first appears in the stream. Consumed once.
+let deepLinkTrip: string | null = new URLSearchParams(location.search).get("trip");
 window.addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
   if (k === "b") {
@@ -110,7 +116,7 @@ window.addEventListener("keydown", (e) => {
   else if (k === "y") showGraph = !showGraph;
 });
 
-const routeOfShape = (id: string) => id.split("..")[0];
+const routeOfShape = routeFromShapeId; // shared/config.ts — one parsing definition
 const shapeColor = (id: string): [number, number, number] => {
   const r = routes[routeOfShape(id)];
   return r ? hex2rgb(r.color) : [63, 216, 255];
@@ -287,7 +293,26 @@ function trainLayers() {
       cars.push({ position: [p[0], p[1], z], angle: bearingAt(shape, d), color: v.color, v });
     }
   }
+  const anomalous = heads.filter((v) => v.anomaly);
+  // pulse phase shared per frame (rebuilt each frame anyway)
+  const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 300);
   return [
+    // P4: anomaly pulse — amber breathing halo on trains flagged as running
+    // anomalously slow vs schedule (always on; it IS the alert).
+    ...(anomalous.length
+      ? [
+          new ScatterplotLayer({
+            id: "train-anomaly", data: anomalous,
+            getPosition: (d: Vehicle) => d.position,
+            getFillColor: [240, 168, 48, Math.round(40 + 70 * pulse)] as [number, number, number, number],
+            stroked: true, getLineColor: [240, 168, 48, 235], lineWidthMinPixels: 2,
+            getRadius: 60 + 45 * pulse, radiusMinPixels: 10, radiusMaxPixels: 42,
+            pickable: false,
+            updateTriggers: { getPosition: performance.now(), getRadius: performance.now(), getFillColor: performance.now() },
+            parameters: { depthTest: false },
+          }),
+        ]
+      : []),
     // Kalman position-uncertainty halo (K toggle): radius = √variance in meters,
     // so it tightens on confident tracks and swells when the filter is unsure.
     ...(showUncertainty
@@ -515,7 +540,9 @@ function onHover(info: PickingInfo) {
 }
 
 let loggedFirst = false;
-function applyState(list: any[]) {
+// prune=false when called from applyDelta with a partial (meta-only) list —
+// absent vehicles are then NOT departures, just unchanged.
+function applyState(list: any[], prune = true) {
   const seen = new Set<string>();
   const busSeen = new Set<string>();
   for (const s of list) {
@@ -546,6 +573,7 @@ function applyState(list: any[]) {
       ex.route = s.route; ex.nextStopName = s.nextStopName;
       ex.elevation = s.elevation ?? "underground"; // can change if shape resolution reroutes (express/local)
       ex.uncertainty = s.uncertainty;
+      ex.anomaly = s.anomaly ?? false;
       const drift = s.dist - ex.dist;
       if (Math.abs(drift) > 1500) { ex.dist = s.dist; ex.correct = 0; }
       else ex.correct = drift; // signed; absorbed as gentle speed-up/slow-down in frame()
@@ -558,18 +586,62 @@ function applyState(list: any[]) {
         angle: bearingAt(shapes[s.shapeId], s.dist),
         elevation: s.elevation ?? "underground",
         uncertainty: s.uncertainty,
+        anomaly: s.anomaly ?? false,
       });
     }
+    // Deep-link (?trip=<id>): first time the linked trip appears, fly to it.
+    if (deepLinkTrip && s.id.endsWith(deepLinkTrip)) {
+      const v = vehicles.get(s.id);
+      if (v) {
+        map.flyTo({ center: [v.position[0], v.position[1]], zoom: 14 });
+        deepLinkTrip = null; // once
+      }
+    }
   }
-  for (const id of [...vehicles.keys()]) if (!seen.has(id)) vehicles.delete(id);
-  for (const id of [...buses.keys()]) if (!busSeen.has(id)) buses.delete(id);
+  if (prune) {
+    for (const id of [...vehicles.keys()]) if (!seen.has(id)) vehicles.delete(id);
+    for (const id of [...buses.keys()]) if (!busSeen.has(id)) buses.delete(id);
+  }
   statBase = `${vehicles.size} trains · ${buses.size} buses live · NYC`;
   (window as any).__tt = { vehicles, buses, shapes, map, overlay };
 }
 
+// P5 delta protocol: compact per-tick tuples for unchanged-meta vehicles
+// ([id, dist, speed, uncertainty, anomaly01, lon, lat]), full objects only for
+// new/meta-changed ones, rm for departures. Snapshot on connect + periodic
+// resync stays authoritative — a missed delta self-heals within ~60s.
+function applyDelta(m: any) {
+  for (const s of m.meta ?? []) applyState([s], /*prune*/ false);
+  for (const t of m.up ?? []) {
+    const [id, dist, speed, unc, flags, lon, lat, nextStop] = t as [string, number | null, number, number | null, number, number | null, number | null, string | null];
+    const ex = vehicles.get(id);
+    if (ex && dist != null) {
+      const drift = dist - ex.dist;
+      if (Math.abs(drift) > 1500) { ex.dist = dist; ex.correct = 0; }
+      else ex.correct = drift;
+      ex.speed = speed;
+      ex.uncertainty = unc ?? undefined;
+      ex.anomaly = (flags & 1) === 1; // bit1 (stale) currently unused by the renderer
+      if (nextStop != null) ex.nextStopName = nextStop;
+      continue;
+    }
+    const eb = buses.get(id);
+    if (eb && lon != null && lat != null) {
+      const mx = (lon - eb.tLon) * 111320 * Math.cos((lat * Math.PI) / 180);
+      const my = (lat - eb.tLat) * 111320;
+      if (Math.hypot(mx, my) > 15) eb.heading = ((Math.atan2(mx, my) * 180) / Math.PI + 360) % 360;
+      eb.tLon = lon; eb.tLat = lat; eb.speed = speed;
+      if (Math.abs(eb.tLon - eb.lon) > 0.02 || Math.abs(eb.tLat - eb.lat) > 0.02) { eb.lon = eb.tLon; eb.lat = eb.tLat; }
+    }
+    // unknown id (missed its meta message) — the next resync snapshot heals it
+  }
+  for (const id of m.rm ?? []) { vehicles.delete(id); buses.delete(id); }
+  statBase = `${vehicles.size} trains · ${buses.size} buses live · NYC`;
+}
+
 function connect() {
-  const ws = new WebSocket(WS);
-  ws.onopen = () => console.log("[ws] connected", WS);
+  const ws = new WebSocket(`${WS}/?proto=delta`);
+  ws.onopen = () => console.log("[ws] connected (delta protocol)", WS);
   ws.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.type === "snapshot" || m.type === "state") {
@@ -579,6 +651,9 @@ function connect() {
         loggedFirst = true;
         console.log(`[ws] ${m.type}: ${m.vehicles?.length ?? 0} -> ${vehicles.size} rendered`);
       }
+    } else if (m.type === "delta") {
+      applyDelta(m);
+      graphEdges = m.graphEdges ?? [];
     }
   };
   ws.onclose = () => { statEl.textContent = "reconnecting…"; setTimeout(connect, 2000); };

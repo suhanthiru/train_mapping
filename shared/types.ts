@@ -24,6 +24,7 @@ export interface VehicleState {
   nextStopName?: string;
   delay?: number; // seconds, +late / -early
   stale?: boolean;
+  anomaly?: boolean; // P4: currently flagged as running anomalously slow vs schedule
 }
 
 /** A track polyline with precomputed cumulative distance at each vertex. */

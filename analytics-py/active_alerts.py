@@ -14,11 +14,14 @@ import os
 import sqlite3
 import time
 
+import alert_index
+
 HERE = os.path.dirname(__file__)
 LEDGER = os.environ.get("LEDGER_DB", os.path.join(HERE, "..", "data", "ledger.db"))
 
 CACHE_TTL_SECONDS = 60  # alerts change faster than ridership patterns
-ACTIVE_WINDOW_SECONDS = 300  # an alert logged in the last 5 min counts as "active now"
+# window definition lives in alert_index.py (P3) so all consumers agree
+ACTIVE_WINDOW_SECONDS = alert_index.LIVE_WINDOW_S
 
 _state = {"ts": 0, "routes": set()}
 

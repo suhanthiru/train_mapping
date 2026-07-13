@@ -27,6 +27,8 @@ import mta_ridership
 import active_alerts
 import train_eta
 import build_goldenset
+import anomaly
+import featurize
 
 RETRAIN_EVERY_S = 6 * 3600  # continuous retraining cadence
 
@@ -135,6 +137,7 @@ def health():
         s["v2_n_train"], s["v2_mae"] = _feats_v2.get("n_train"), _feats_v2.get("mae")
     return {"ok": True, "model_loaded": _model is not None,
             "model_v2_loaded": _model_v2 is not None,
+            "anomaly_ready": _anomaly_ready,
             "ridership": mta_ridership.status(),
             "alerts": active_alerts.status(), **s}
 
@@ -143,6 +146,73 @@ def health():
 def retrain():
     ok = do_retrain()
     return {"ok": ok, **_model_status}
+
+
+# Pre-warm the anomaly baselines in the background at startup. The first build
+# pulls from Socrata (measured: minutes cold) — without this, the first
+# /anomaly/* request after a restart would block that whole time. Never blocks
+# startup itself (a healthcheck on /health must not flap while caches build).
+_anomaly_ready = False
+
+
+def _warm_anomaly_baselines():
+    global _anomaly_ready
+    try:
+        import mta_history
+        t0 = time.time()
+        mta_history.schedule_hop_seconds()
+        mta_history.runtime_baseline()
+        mta_history.incident_prior()
+        anomaly._alerts()
+        _anomaly_ready = True
+        print(f"[anomaly] baselines warm in {time.time() - t0:.0f}s")
+    except Exception as e:
+        # stay not-ready; endpoints keep answering 503 rather than blocking
+        print("[anomaly] baseline warm-up failed:", e)
+
+
+# ANOMALY_WARM=0 disables the startup warm (tests/CI import this module and
+# must stay hermetic — the warm thread would otherwise hit Socrata on a cold
+# cache). Endpoints then 503 until a warm is triggered some other way.
+if os.environ.get("ANOMALY_WARM", "1") != "0":
+    threading.Thread(target=_warm_anomaly_baselines, daemon=True).start()
+
+
+class HopObs(BaseModel):
+    id: str                 # caller key (e.g. tripId), echoed back
+    route_id: str
+    from_stop: str
+    to_stop: str
+    ts: int                 # epoch seconds of the observation
+    observed_sec: float     # seconds elapsed so far / taken on this hop
+
+
+class TripObs(BaseModel):
+    id: str
+    stop_path_id: str
+    ts: int
+    observed_runtime_sec: float
+
+
+@app.post("/anomaly/hop")
+def anomaly_hop(obs: list[HopObs]):
+    """Flag hops running anomalously slow vs their scheduled time, with
+    disruption context (active alert + the line's dominant delay cause). This is
+    the disruption signal the ETA models can't supply — see anomaly.py."""
+    if not _anomaly_ready:
+        return JSONResponse({"warming": True, "error": "anomaly baselines still warming"}, status_code=503)
+    return [{"id": o.id, **anomaly.score_hop(o.route_id, o.from_stop, o.to_stop,
+                                             o.ts, o.observed_sec)} for o in obs]
+
+
+@app.post("/anomaly/trip")
+def anomaly_trip(obs: list[TripObs]):
+    """Flag whole trips slower than their historical p75 running time (distribution
+    -aware), with likely-cause context."""
+    if not _anomaly_ready:
+        return JSONResponse({"warming": True, "error": "anomaly baselines still warming"}, status_code=503)
+    return [{"id": o.id, **anomaly.score_trip(o.stop_path_id, o.ts, o.observed_runtime_sec)}
+            for o in obs]
 
 
 @app.get("/context")
@@ -204,17 +274,11 @@ def feature_importance():
 
 # Feature rows are built from the SAVED feat_order (eta_features.json), not a
 # hardcoded list — so serving works with models trained before AND after the
-# ridership feature landed, and any future feature just needs a value below.
+# ridership feature landed. Encoding itself lives in featurize.encode_rows —
+# the SAME function training uses, so train/serve cannot drift (pinned by
+# tests/test_featurize_parity.py).
 def _feature_row(feats: dict, vals: dict) -> list[float]:
-    enc = feats["encoders"]
-    row: list[float] = []
-    for c in feats["feat_order"]:
-        if c in enc:  # categorical, label-encoded (-1 = unseen)
-            row.append(enc[c].get(str(vals.get(c)), -1))
-        else:  # numeric; missing -> 0.0 (must match train_eta's policy)
-            v = vals.get(c)
-            row.append(float(v) if v is not None else 0.0)
-    return row
+    return featurize.encode_rows([vals], feats["feat_order"], feats["encoders"])[0].tolist()
 
 
 def _enrich(vals: dict, feats: dict) -> dict:
