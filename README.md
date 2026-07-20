@@ -13,6 +13,44 @@ Atlanta (MARTA) and Paris (IDFM) planned as additional adapters. See
 (served at `/docs/architecture.html`) for the current system diagram, and
 [docs/explainer.html](docs/explainer.html) for the plain-words tour.
 
+## Quick Start (Docker Compose)
+
+The easiest way to run the entire stack (macOS, Linux, Windows):
+
+### 1. One-time setup
+
+**Linux / macOS / WSL / Git Bash:**
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+**Windows PowerShell:**
+```powershell
+.\setup.ps1
+```
+
+This downloads NYC subway geometry, builds the map UI, and validates everything.
+
+### 2. Start the stack
+
+```bash
+docker compose up --build
+```
+
+Then visit:
+- **3D Map:** http://localhost:8080
+- **Analytics Dashboard:** http://localhost:4174
+- **Service Hub:** http://localhost:8080/hub
+
+Press Ctrl+C to stop.
+
+**That's it.** All 5 services (map, analytics, predictions, anomalies, Kalman filter) start automatically.
+
+For 24/7 hosting on a server, see [DEPLOY.md](DEPLOY.md).
+
+---
+
 ## How it works
 
 GTFS-realtime gives predicted arrival times per stop, not continuous GPS — so the

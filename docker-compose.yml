@@ -1,5 +1,5 @@
 # One-command run of the whole polyglot stack: `docker compose up --build`.
-# Services talk over the default bridge network by name (backend, kalman-rs, …);
+# Services talk over the default bridge network by name (train_3d_map, kalman-rs, …);
 # host ./data is a volume so the SQLite ledgers persist across restarts.
 services:
   kalman-rs:
@@ -16,7 +16,7 @@ services:
   analytics-py:
     build: ./analytics-py
     ports: ["8091:8091"]
-    # Bind-mount ./data so the model reads the same ledger the backend writes and
+    # Bind-mount ./data so the model reads the same ledger train_3d_map writes and
     # persists the trained model across restarts (MODEL_DIR). Without this the
     # containerized retrain reads an empty DB and /predict 503s on every restart.
     environment:
@@ -41,7 +41,7 @@ services:
       retries: 3
       start_period: 20s
 
-  backend:
+  train_3d_map:
     build:
       context: .
       dockerfile: Dockerfile.backend
@@ -49,7 +49,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./web/dist:/app/web/dist:ro
-    # service_healthy (not just started): backend's first tick calls both deps;
+    # service_healthy (not just started): train_3d_map's first tick calls both deps;
     # racing ahead of them used to cost a full timeout cascade on cold boots.
     depends_on:
       kalman-rs:
@@ -72,7 +72,7 @@ services:
     # probe with (the Go binary is the only executable). It does expose GET
     # /health on :8090 for external monitors.
     depends_on:
-      backend:
+      train_3d_map:
         condition: service_healthy
       analytics-py:
         condition: service_healthy

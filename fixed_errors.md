@@ -42,7 +42,7 @@ reconstructed from real evidence, not guessed:
   - `docker-compose.yml` now bind-mounts `./data:/data` on `analytics-py` and sets
     `LEDGER_DB=/data/ledger.db`, `MODEL_DIR=/data/models`,
     `GOLDENSET_DIR=/data/exports/goldenset` — so the service reads the **same**
-    ledger the backend writes and persists the model on the host.
+    ledger train_3d_map writes and persists the model on the host.
   - `train_eta.py` `os.makedirs(MODEL_DIR)` guards a fresh host where the dir
     doesn't exist yet.
 - **Verify:** `docker compose config -q` passes. On a host: `POST /retrain`

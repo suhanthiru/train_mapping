@@ -10,12 +10,12 @@
 //    through to each backend (see those files for the matching routes).
 // Ports/colors come from window.TT_CONFIG (dashboard/config.js — GENERATED
 // from shared/config.ts, the single source; regenerate: npm run gen:config).
-const CFG = window.TT_CONFIG ?? { ports: { backend: 8080, kalmanRs: 8092, analyticsPy: 8091, dashboard: 4174 },
+const CFG = window.TT_CONFIG ?? { ports: { train_3d_map: 8080, kalmanRs: 8092, analyticsPy: 8091, dashboard: 4174 },
                                   colors: { accent: "#3FD8FF", axis: "#8b98a5", grid: "#1f2937" } };
 const H = location.hostname || "localhost";
 const PROTO = location.protocol === "file:" ? "http:" : location.protocol;
 const directPort = location.port === String(CFG.ports.dashboard) || location.protocol === "file:";
-const BACKEND = directPort ? `${PROTO}//${H}:${CFG.ports.backend}` : `${location.origin}/api-backend`;
+const BACKEND = directPort ? `${PROTO}//${H}:${CFG.ports.train_3d_map}` : `${location.origin}/api-backend`;
 const KALMAN = directPort ? `${PROTO}//${H}:${CFG.ports.kalmanRs}` : `${location.origin}/api-kalman`;
 const ANALYTICS = directPort ? `${PROTO}//${H}:${CFG.ports.analyticsPy}` : `${location.origin}/api-analytics`;
 

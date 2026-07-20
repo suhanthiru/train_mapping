@@ -15,7 +15,7 @@ services:
     <<: *prod
   analytics-py:
     <<: *prod
-  backend:
+  train_3d_map:
     <<: *prod
   analytics-go:
     <<: *prod

@@ -54,16 +54,16 @@ git clone <your-repo-url> train_tracker && cd train_tracker
 
 ## 4. One-time data prep (the repo ignores generated data)
 The static geometry and elevation data aren't in git. Generate them once into the
-mounted `data/` folder using the backend image (no local Node needed):
+mounted `data/` folder using the train_3d_map image (no local Node needed):
 ```bash
-docker compose build backend
-docker compose run --rm backend npm run preprocess:nyc          # GTFS geometry (required)
-docker compose run --rm backend npm run preprocess:osm-layers   # elevation (optional feature)
-docker compose run --rm backend npm run preprocess:osm-match
+docker compose build train_3d_map
+docker compose run --rm train_3d_map npm run preprocess:nyc          # GTFS geometry (required)
+docker compose run --rm train_3d_map npm run preprocess:osm-layers   # elevation (optional feature)
+docker compose run --rm train_3d_map npm run preprocess:osm-match
 ```
 
 **Build the map UI too** — `web/dist` is gitignored and bind-mounted (read-only)
-into the backend, so on a fresh clone the map would be empty without this step.
+into train_3d_map, so on a fresh clone the map would be empty without this step.
 No local Node needed — use a throwaway node container writing into `./web`:
 ```bash
 docker run --rm -v "$PWD/web":/w -w /w node:24-slim sh -c "npm ci && npm run build"

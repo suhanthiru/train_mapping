@@ -6,7 +6,7 @@ reusable for future analysis, graph work, or any other tool.
 
 ## Storage
 
-- **`data/ledger.db`** — SQLite (Node's built-in `node:sqlite`, no server). Written live by the backend (`server/index.ts`); 30-day retention (`prune()`).
+- **`data/ledger.db`** — SQLite (Node's built-in `node:sqlite`, no server). Written live by train_3d_map (`server/index.ts`); 30-day retention (`prune()`).
 - **`data/exports/`** — periodic dumps in **Parquet** (columnar, compressed — the data-lake standard) and **CSV** (universal). Produced by `npm run export:{graph,data,all}` (`history/export.ts`, via DuckDB). These are also the archival store beyond the 30-day DB prune.
 
 All timestamps are **epoch seconds (UTC)**. `hour`/`dow` in `segments` are **local time on the host** (assumed America/New_York) — for time-of-day patterns.
