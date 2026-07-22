@@ -10,7 +10,7 @@
 //    through to each backend (see those files for the matching routes).
 // Ports/colors come from window.TT_CONFIG (dashboard/config.js — GENERATED
 // from shared/config.ts, the single source; regenerate: npm run gen:config).
-const CFG = window.TT_CONFIG ?? { ports: { train_3d_map: 8080, kalmanRs: 8092, analyticsPy: 8091, dashboard: 4174 },
+const CFG = window.TT_CONFIG ?? { ports: { train_3d_map: 8088, kalmanRs: 8092, analyticsPy: 8091, dashboard: 4174 },
                                   colors: { accent: "#3FD8FF", axis: "#8b98a5", grid: "#1f2937" } };
 const H = location.hostname || "localhost";
 const PROTO = location.protocol === "file:" ? "http:" : location.protocol;
@@ -514,13 +514,34 @@ async function loadAnomalies() {
     <div class="card"><div class="k">episodes (6h)</div><div class="v">${recent.length}</div></div>
     <div class="card"><div class="k">with known alert</div><div class="v">${cur.filter((a) => a.alert_active).length}/${cur.length}</div></div>`;
 
+  // Plain-language callout for the few most-severe active anomalies: states
+  // that something's wrong right now, why, and — when there's enough episode
+  // history — how long it should take. Capped so a busy period doesn't turn
+  // this into a wall of text; the rest live in the table below.
+  const SUMMARY_MAX = 3;
+  const summaryEl = document.getElementById("anomaly-summary");
+  if (!cur.length) {
+    summaryEl.innerHTML = "";
+  } else {
+    const sorted = [...cur].sort((a, b) => (b.deviation_sec ?? 0) - (a.deviation_sec ?? 0));
+    const shown = sorted.slice(0, SUMMARY_MAX).map((a) => {
+      const known = !!a.typical_duration;
+      return `<div class="plain-card ${known ? "plain-bad" : ""}"><span class="plain-emoji">${known ? "🚧" : "⏳"}</span>${a.summary}</div>`;
+    }).join("");
+    const more = sorted.length > SUMMARY_MAX
+      ? `<div class="empty">+ ${sorted.length - SUMMARY_MAX} more active — see the table below</div>`
+      : "";
+    summaryEl.innerHTML = shown + more;
+  }
+
   const tbl = document.getElementById("anomaly-table");
   if (!cur.length) {
     tbl.innerHTML = `<div class="empty">no trains currently anomalous — checking every 30s${recent.length ? ` · ${recent.length} episode(s) in the last 6h below the fold` : ""}</div>`;
   } else {
-    const rows = cur
-      .sort((a, b) => (b.deviation_sec ?? 0) - (a.deviation_sec ?? 0))
-      .slice(0, 12)
+    const TABLE_MAX = 6;
+    const sorted = [...cur].sort((a, b) => (b.deviation_sec ?? 0) - (a.deviation_sec ?? 0));
+    const rows = sorted
+      .slice(0, TABLE_MAX)
       .map((a) => `<tr>
         <td><a href="${BACKEND}/?trip=${encodeURIComponent(a.id)}" target="_blank" title="show on the live map" style="text-decoration:none">${routeBadge(a.route_id)}</a></td>
         <td>${a.from_stop} → ${a.to_stop}</td>
@@ -529,7 +550,10 @@ async function loadAnomalies() {
         <td>${a.alert_active ? "🔔 alert active" : "no alert"}</td>
         <td>${a.likely_cause?.cause ?? "—"}</td>
       </tr>`).join("");
-    tbl.innerHTML = `<table><tr><th>route</th><th>hop</th><th>observed vs scheduled</th><th>over</th><th>alert?</th><th>likely cause</th></tr>${rows}</table>`;
+    const overflow = sorted.length > TABLE_MAX
+      ? `<div class="empty" style="margin-top:6px">+ ${sorted.length - TABLE_MAX} more active · ${recent.length} episode(s) in the last 6h</div>`
+      : "";
+    tbl.innerHTML = `<table><tr><th>route</th><th>hop</th><th>observed vs scheduled</th><th>over</th><th>alert?</th><th>likely cause</th></tr>${rows}</table>${overflow}`;
   }
   return { cur, recent };
 }
@@ -550,21 +574,30 @@ async function loadOpsRow(anom) {
     r.recent++; r.cause = r.cause ?? a.cause;
     byRoute.set(a.route_id, r);
   }
-  if (!byRoute.size) {
-    el.innerHTML = `<div class="empty">all routes nominal · model-v2 avg MAE ${v2mae != null ? fmtDuration(v2mae) : "n/a"}</div>`;
+  const maeStr = v2mae != null ? fmtDuration(v2mae) : "n/a";
+  const active = [...byRoute.entries()]
+    .filter(([, r]) => r.active > 0)
+    .sort((a, b) => b[1].active - a[1].active || b[1].recent - a[1].recent);
+
+  // When nothing is actively anomalous, an 18-row table of "0 active" is pure
+  // noise — collapse to a single compact line. Only enumerate routes that are
+  // ACTUALLY anomalous right now; recent-only history stays as a summary count.
+  if (!active.length) {
+    el.innerHTML = `<div class="empty">all routes nominal · ${anom.recent.length} episode(s) across ${byRoute.size} route(s) in 6h · model-v2 avg MAE ${maeStr}</div>`;
     return;
   }
-  const rows = [...byRoute.entries()]
-    .sort((a, b) => b[1].active - a[1].active || b[1].recent - a[1].recent)
-    .map(([route, r]) => `<tr>
+  const OPS_MAX = 8;
+  const rows = active.slice(0, OPS_MAX).map(([route, r]) => `<tr>
       <td>${routeBadge(route)}</td>
-      <td style="color:${r.active ? "#f0902f" : "#7ed957"}">${r.active} active</td>
+      <td style="color:#f0902f">${r.active} active</td>
       <td>${r.recent} episode(s) 6h</td>
       <td>${r.alert ? "🔔 alert" : "—"}</td>
       <td>${r.cause ?? "—"}</td>
-      <td>${v2mae != null ? "v2 MAE " + fmtDuration(v2mae) : ""}</td>
+      <td>${v2mae != null ? "v2 MAE " + maeStr : ""}</td>
     </tr>`).join("");
-  el.innerHTML = `<table><tr><th>route</th><th>now</th><th>history</th><th>alert</th><th>dominant cause</th><th>model</th></tr>${rows}</table>`;
+  const overflow = active.length > OPS_MAX ? ` · + ${active.length - OPS_MAX} more active route(s)` : "";
+  el.innerHTML = `<table><tr><th>route</th><th>now</th><th>history</th><th>alert</th><th>dominant cause</th><th>model</th></tr>${rows}</table>`
+    + `<div class="empty" style="margin-top:6px">${anom.recent.length} recent episode(s) across ${byRoute.size} route(s) in 6h${overflow}</div>`;
 }
 
 async function refresh() {

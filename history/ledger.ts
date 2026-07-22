@@ -40,6 +40,7 @@ export class PredictionLedger {
   private insVehLog;
   private insAlert;
   private insAnomaly;
+  private resolveAnomaly;
   private getWatermark;
   private setWatermark;
   private prevActual;
@@ -52,6 +53,10 @@ export class PredictionLedger {
   // anomalies_log episode-detection: "tripId|toStop" -> last logged ts. A slow
   // trip stays slow for many ticks — log one row per episode, not per tick.
   private lastAnomaly = new Map<string, number>();
+  // "tripId|toStop" -> rowid of that episode's still-open anomalies_log row,
+  // so resolveAnomalies() can stamp resolved_at once the trip clears the hop
+  // — the source of "how long did this actually take" for typicalDurationSec().
+  private openAnomalyRow = new Map<string, number>();
 
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true });
@@ -180,6 +185,11 @@ export class PredictionLedger {
       CREATE INDEX IF NOT EXISTS idx_anom_ts ON anomalies_log(ts);
       CREATE INDEX IF NOT EXISTS idx_anom_route ON anomalies_log(route_id, ts);
     `);
+    // idempotent column add (for anomalies_log tables created before duration
+    // tracking): NULL while an episode is still ongoing, stamped by
+    // resolveAnomalies() once the trip clears — resolved_at - ts is then the
+    // one source of truth typicalDurationSec() learns "how long" from.
+    try { this.db.exec(`ALTER TABLE anomalies_log ADD COLUMN resolved_at INTEGER`); } catch { /* already exists */ }
     this.insPred = this.db.prepare(
       `INSERT INTO predictions (trip_id, stop_id, route_id, pred_arrival, observed_at)
        VALUES (?, ?, ?, ?, ?)`
@@ -207,6 +217,9 @@ export class PredictionLedger {
     this.insAnomaly = this.db.prepare(
       `INSERT INTO anomalies_log (ts, trip_id, route_id, from_stop, to_stop, observed_sec, scheduled_sec, deviation_sec, alert_active, cause)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    this.resolveAnomaly = this.db.prepare(
+      `UPDATE anomalies_log SET resolved_at = ? WHERE rowid = ? AND resolved_at IS NULL`
     );
     this.db.exec(`INSERT OR IGNORE INTO segments_watermark (id, last_actual_arrival) VALUES (1, 0)`);
     this.getWatermark = this.db.prepare(
@@ -243,11 +256,12 @@ export class PredictionLedger {
         const last = this.lastAnomaly.get(key);
         if (last != null && r.ts - last < REANOMALY_GAP_S) continue;
         this.lastAnomaly.set(key, r.ts);
-        this.insAnomaly.run(
+        const info = this.insAnomaly.run(
           r.ts, r.tripId, r.routeId, r.fromStop, r.toStop,
           r.observedSec, r.scheduledSec, r.deviationSec,
           r.alertActive ? 1 : 0, r.cause
         );
+        this.openAnomalyRow.set(key, Number(info.lastInsertRowid));
         logged++;
       }
       this.db.exec("COMMIT");
@@ -258,12 +272,62 @@ export class PredictionLedger {
     return logged;
   }
 
+  /** Close out episodes that dropped off the currently-active set (the trip
+   *  cleared the hop, sped back up, or disappeared) — stamps resolved_at so
+   *  the episode's actual duration (resolved_at - ts) becomes something
+   *  typicalDurationSec() can learn from. Call every anomaly tick with the
+   *  full set of still-active "tripId|toStop" keys, including an empty set
+   *  when nothing is active — that's what closes out the last stragglers. */
+  resolveAnomalies(activeKeys: Set<string>, resolvedAt: number): void {
+    for (const [key, rowid] of this.openAnomalyRow) {
+      if (activeKeys.has(key)) continue;
+      this.resolveAnomaly.run(resolvedAt, rowid);
+      this.openAnomalyRow.delete(key);
+    }
+  }
+
+  /** Median resolution time for past anomalies "like this one", so a live
+   *  incident can be framed as "typically clears in ~N min" instead of just
+   *  "something's wrong". Tries (route, cause) first — the most specific,
+   *  most useful comparison — and falls back to (cause) across all routes
+   *  when a single route+cause pair is too sparse to trust. Returns null
+   *  (not a guess) when there isn't enough history at either level yet;
+   *  callers must say "not enough history" rather than fabricate a number. */
+  typicalDurationSec(
+    routeId: string | null, cause: string | null
+  ): { medianSec: number; n: number; scope: "route" | "cause" } | null {
+    const MIN_SAMPLES = 3;
+    const median = (durations: number[]) => {
+      const s = [...durations].sort((a, b) => a - b);
+      return s[Math.floor(s.length / 2)];
+    };
+    if (routeId && cause) {
+      const rows = this.db.prepare(
+        `SELECT resolved_at - ts AS d FROM anomalies_log
+         WHERE route_id = ? AND cause = ? AND resolved_at IS NOT NULL`
+      ).all(routeId, cause) as { d: number }[];
+      if (rows.length >= MIN_SAMPLES) {
+        return { medianSec: median(rows.map((r) => r.d)), n: rows.length, scope: "route" };
+      }
+    }
+    if (cause) {
+      const rows = this.db.prepare(
+        `SELECT resolved_at - ts AS d FROM anomalies_log
+         WHERE cause = ? AND resolved_at IS NOT NULL`
+      ).all(cause) as { d: number }[];
+      if (rows.length >= MIN_SAMPLES) {
+        return { medianSec: median(rows.map((r) => r.d)), n: rows.length, scope: "cause" };
+      }
+    }
+    return null;
+  }
+
   /** Recent flagged anomalies for the dashboard's incident-review panel. */
   recentAnomalies(sinceSeconds = 6 * 3600, limit = 200): Record<string, unknown>[] {
     const since = Math.floor(Date.now() / 1000) - sinceSeconds;
     return this.db.prepare(
       `SELECT ts, trip_id, route_id, from_stop, to_stop, observed_sec,
-              scheduled_sec, deviation_sec, alert_active, cause
+              scheduled_sec, deviation_sec, alert_active, cause, resolved_at
        FROM anomalies_log WHERE ts > ? ORDER BY ts DESC LIMIT ?`
     ).all(since, limit) as Record<string, unknown>[];
   }
@@ -530,6 +594,11 @@ export class PredictionLedger {
     const vehCutoff = now - 6 * 3600;
     for (const [k, v] of this.lastVehLog) if (v.ts < vehCutoff) this.lastVehLog.delete(k);
     for (const [k, t] of this.lastAnomaly) if (t < vehCutoff) this.lastAnomaly.delete(k);
+    // Both maps are always set together in recordAnomalies(), so an
+    // openAnomalyRow key that just fell out of lastAnomaly above (6h+ stale)
+    // is a leaked episode — e.g. a process that died mid-episode and never
+    // got to call resolveAnomalies(). Stop tracking it either way.
+    for (const k of this.openAnomalyRow.keys()) if (!this.lastAnomaly.has(k)) this.openAnomalyRow.delete(k);
     return removed;
   }
 

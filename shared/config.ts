@@ -11,7 +11,8 @@
 // docs/hub.html shows ports as display text only — update it when these change.
 
 export const PORTS = {
-  train_3d_map: 8080, // Node: ingest + WS + map + /hub + /docs
+  train_3d_map: 8088, // Node: ingest + WS + map + /hub + /docs (8088 not 8080:
+                      // 8080 is commonly squatted by other local agents)
   analyticsGo: 8090,  // Go: streaming analytics (has its own /anomalies)
   analyticsPy: 8091,  // Python: ETA models + anomaly scoring (FastAPI)
   kalmanRs: 8092,     // Rust: position/uncertainty filter

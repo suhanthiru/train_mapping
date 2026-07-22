@@ -1,5 +1,5 @@
 // Minimal static file server for web/dist (verification/preview only).
-// The app fetches live data + WebSocket from the backend on :8080.
+// The app fetches live data + WebSocket from the backend on :8088.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { join, extname, normalize, resolve } from "node:path";

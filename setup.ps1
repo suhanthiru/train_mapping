@@ -102,7 +102,7 @@ function Preprocess-OSM {
 # Build the map UI
 function Build-WebUI {
   Write-Info "Building map UI (Vite + deck.gl)..."
-  docker run --rm -v "$PWD/web":/w -w /w node:24-slim sh -c "npm ci; npm run build"
+  docker run --rm -v "${PWD}:/repo" -w /repo/web node:24-slim sh -c "npm ci; npm run build"
   if ($LASTEXITCODE -ne 0) {
     Write-Err "Failed to build map UI"
     return $false
@@ -163,7 +163,7 @@ function Show-Help {
   Write-Host "  docker compose up --build"
   Write-Host ""
   Write-Host "Then visit:"
-  Write-Host "  - Map: http://localhost:8080"
+  Write-Host "  - Map: http://localhost:8088"
   Write-Host "  - Dashboard: http://localhost:4174"
   Write-Host ""
   Write-Host "For more info, see DEPLOY.md or README.md"
@@ -234,7 +234,7 @@ function Main {
     Write-Host "  docker compose up --build"
     Write-Host ""
     Write-Info "Then visit:"
-    Write-Host "  Map:       http://localhost:8080"
+    Write-Host "  Map:       http://localhost:8088"
     Write-Host "  Dashboard: http://localhost:4174"
     Write-Host ""
   }

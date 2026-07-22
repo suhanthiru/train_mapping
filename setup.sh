@@ -81,7 +81,7 @@ preprocess_osm() {
 # Build the map UI
 build_web_ui() {
   log_info "Building map UI (Vite + deck.gl)..."
-  docker run --rm -v "$PWD/web":/w -w /w node:24-slim sh -c "npm ci && npm run build"
+  docker run --rm -v "$PWD":/repo -w /repo/web node:24-slim sh -c "npm ci && npm run build"
   log_success "Map UI built to ./web/dist"
 }
 
@@ -95,7 +95,7 @@ validate_setup() {
   fi
 
   if [ ! -d "./web/dist" ]; then
-    log_error "Map UI missing. Run: docker run --rm -v \"\$PWD/web\":/w -w /w node:24-slim sh -c \"npm ci && npm run build\""
+    log_error "Map UI missing. Run: docker run --rm -v \"\$PWD\":/repo -w /repo/web node:24-slim sh -c \"npm ci && npm run build\""
     return 1
   fi
 
@@ -133,7 +133,7 @@ AFTER SETUP:
   docker compose up --build
 
 Then visit:
-  - Map: http://localhost:8080
+  - Map: http://localhost:8088
   - Dashboard: http://localhost:4174
 
 For more info, see DEPLOY.md or README.md
@@ -222,7 +222,7 @@ main() {
     echo "  docker compose up --build"
     echo ""
     log_info "Then visit:"
-    echo "  Map:       http://localhost:8080"
+    echo "  Map:       http://localhost:8088"
     echo "  Dashboard: http://localhost:4174"
     echo ""
   else

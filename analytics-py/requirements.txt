@@ -6,3 +6,4 @@ fastapi==0.139.0
 uvicorn==0.50.0
 xgboost==3.2.0
 numpy==2.4.6
+polars==1.43.0

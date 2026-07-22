@@ -69,7 +69,7 @@ reconstructed from real evidence, not guessed:
 - **Severity:** Low — worked locally, broke on a remote host.
 - **Where:** `dashboard/app.js` (top-of-file service base URLs).
 - **What it was:** `BACKEND/KALMAN/ANALYTICS` were literal
-  `http://localhost:8080/8091/8092`. Served from a VM, the browser's "localhost"
+  `http://localhost:8088/8091/8092`. Served from a VM, the browser's "localhost"
   is the *viewer's* machine, so every fetch failed.
 - **How it was fixed:** The base URLs now derive from the page's own
   `location.protocol` + `location.hostname` (fixed ports), with a `localhost`
@@ -160,7 +160,7 @@ reconstructed from real evidence, not guessed:
 `Found 2026-07-08 · Fixed 2026-07-08 (session ending 2026-07-09 02:10 AM)`
 - **Severity:** High (latent) — would have silently broken the live map and dashboard the moment TLS was added, not something a smoke test on plain HTTP would catch.
 - **Where:** `web/src/main.ts` (HTTP/WS constants), `dashboard/app.js` (BACKEND/KALMAN/ANALYTICS constants — the I5 fix from earlier this session only got it to "works on one host," not "works behind a proxy," which its own tooltip already flagged as a known gap).
-- **What it was:** both hardcoded an explicit port (`:8080`, `:8091`, etc.) onto the current hostname. Fine when every service publishes its own port on the same host — but behind Caddy/nginx terminating TLS on 443, the page loads as `https://...` with no port, and the JS would then try `https://host:8080` (a plain-HTTP service with no TLS listener) — an HTTPS page fetching over what's actually plain HTTP on that port fails, and the WebSocket equivalent (`ws://` from an `https://` page) is blocked by the browser outright as insecure mixed content.
+- **What it was:** both hardcoded an explicit port (`:8088`, `:8091`, etc.) onto the current hostname. Fine when every service publishes its own port on the same host — but behind Caddy/nginx terminating TLS on 443, the page loads as `https://...` with no port, and the JS would then try `https://host:8088` (a plain-HTTP service with no TLS listener) — an HTTPS page fetching over what's actually plain HTTP on that port fails, and the WebSocket equivalent (`ws://` from an `https://` page) is blocked by the browser outright as insecure mixed content.
 - **How it was fixed:** both now derive same-origin URLs from `location.host`/`location.origin` when not on a known direct-dev port (map: same-origin always, since it's one service on one port; dashboard: same-origin **path-prefixed** — `/api-backend`, `/api-kalman`, `/api-analytics` — proxied through by the new `infra/Caddyfile`/`infra/nginx.conf`). Direct-port dev/VPS access (no proxy) is preserved via a port-based branch (`:5173` for vite dev, `:4174` for the dashboard's own direct port).
 - **Verify:** live in-browser check — `console.log("[ws] connected", WS)` fired with the correct same-origin URL, network tab showed clean 200s on the map bundle + GTFS geometry, `vite build` + `tsc` both clean.
 

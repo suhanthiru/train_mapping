@@ -5,12 +5,12 @@
 // that a plain child.kill() would orphan, leaving ports held).
 //
 // Services (ports authoritative in shared/config.ts — this plain-.mjs launcher
-// can't import TS, so keep the two in sync; hub page at :8080/hub lists them):
+// can't import TS, so keep the two in sync; hub page at :8088/hub lists them):
 //   kalman     :8092  prebuilt exe if present, else cargo run --release
 //   analytics  :8091  python app.py (FastAPI)
-//   backend    :8080  tsx watch server/index.ts
+//   backend    :8088  tsx watch server/index.ts
 //   dashboard  :4174  node dashboard/serve.mjs
-//   web        :5173  vite dev server (HMR; prod path serves web/dist on :8080)
+//   web        :5173  vite dev server (HMR; prod path serves web/dist on :8088)
 import { spawn, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
@@ -82,5 +82,5 @@ function shutdown(reason) {
 process.on("SIGINT", () => shutdown("Ctrl+C"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
-console.log("[dev-all] starting all services — hub at http://localhost:8080/hub\n");
+console.log("[dev-all] starting all services — hub at http://localhost:8088/hub\n");
 for (const s of SERVICES) start(s);

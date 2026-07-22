@@ -35,10 +35,10 @@
 
   <div class="grid">
     <div class="card">
-      <h2><span class="dot" data-probe="http://localhost:8080/health" data-samesite="1"></span>Live Map (3D) <span class="port">:8080</span></h2>
+      <h2><span class="dot" data-probe="http://localhost:8088/health" data-samesite="1"></span>Live Map (3D) <span class="port">:8088</span></h2>
       <p>deck.gl subway + bus map served by the backend (prod build). Trains, elevation toggle, arrivals board.</p>
-      <a href="http://localhost:8080/" target="_blank">open map</a>
-      <a href="http://localhost:8080/health" target="_blank">health</a>
+      <a href="http://localhost:8088/" target="_blank">open map</a>
+      <a href="http://localhost:8088/health" target="_blank">health</a>
     </div>
 
     <div class="card">
@@ -51,7 +51,7 @@
       <h2><span class="dot" data-probe="http://localhost:4174/"></span>Analytics Dashboard <span class="port">:4174</span></h2>
       <p>Chart.js dashboard: live <b style="color:var(--amber)">anomaly panel</b> + per-route ops row, model-vs-feed accuracy, drill-downs.</p>
       <a href="http://localhost:4174/" target="_blank">open dashboard</a>
-      <a href="http://localhost:8080/api/anomalies" target="_blank">anomalies API</a>
+      <a href="http://localhost:8088/api/anomalies" target="_blank">anomalies API</a>
     </div>
 
     <div class="card">
@@ -68,10 +68,10 @@
     </div>
 
     <div class="card">
-      <h2><span class="dot" data-probe="http://localhost:8080/api/system-health" data-samesite="1"></span>Backend API <span class="port">:8080</span></h2>
+      <h2><span class="dot" data-probe="http://localhost:8088/api/system-health" data-samesite="1"></span>Backend API <span class="port">:8088</span></h2>
       <p>Ingest, interpolation, WebSocket push, prediction ledger, accuracy endpoints.</p>
-      <a href="http://localhost:8080/api/system-health" target="_blank">system health</a>
-      <a href="http://localhost:8080/api/prediction-accuracy" target="_blank">accuracy</a>
+      <a href="http://localhost:8088/api/system-health" target="_blank">system health</a>
+      <a href="http://localhost:8088/api/prediction-accuracy" target="_blank">accuracy</a>
     </div>
 
     <div class="card">
@@ -83,7 +83,7 @@
   </div>
 
   <p class="meta">
-    Ports: backend <code>8080</code> · analytics-py <code>8091</code> · kalman-rs <code>8092</code> · dashboard <code>4174</code> · vite <code>5173</code>.
+    Ports: backend <code>8088</code> · analytics-py <code>8091</code> · kalman-rs <code>8092</code> · dashboard <code>4174</code> · vite <code>5173</code>.
     Prod: <code>docker compose up</code> (see DEPLOY.md). Dev: <code>npm run dev:all</code> starts all five with joined logs; Ctrl+C stops the whole tree.
   </p>
 </div>

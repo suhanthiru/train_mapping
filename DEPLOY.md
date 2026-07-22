@@ -25,11 +25,11 @@ tier has no time limit and is generous enough to run this whole stack.
      `ssh-keygen -t ed25519` if you don't have one).
 3. **Networking → open the ports.** In the instance's VCN → Security List (or a
    Network Security Group), add ingress rules for the ports you want reachable
-   (at minimum `8080` map+API and `4174` dashboard; `8090/8091/8092` optional).
+   (at minimum `8088` map+API and `4174` dashboard; `8090/8091/8092` optional).
    Source `0.0.0.0/0` for public, or your home IP `/32` to lock it down.
    Then also open them in the host firewall:
    ```bash
-   sudo iptables -I INPUT -p tcp -m multiport --dports 8080,4174,8090,8091,8092 -j ACCEPT
+   sudo iptables -I INPUT -p tcp -m multiport --dports 8088,4174,8090,8091,8092 -j ACCEPT
    sudo netfilter-persistent save    # persist across reboots
    ```
 4. SSH in: `ssh ubuntu@<public-ip>` and continue to step 2 below.
@@ -66,7 +66,7 @@ docker compose run --rm train_3d_map npm run preprocess:osm-match
 into train_3d_map, so on a fresh clone the map would be empty without this step.
 No local Node needed — use a throwaway node container writing into `./web`:
 ```bash
-docker run --rm -v "$PWD/web":/w -w /w node:24-slim sh -c "npm ci && npm run build"
+docker run --rm -v "$PWD":/repo -w /repo/web node:24-slim sh -c "npm ci && npm run build"
 ```
 
 ## 5. Launch the stack (auto-restarting)
@@ -74,7 +74,7 @@ docker run --rm -v "$PWD/web":/w -w /w node:24-slim sh -c "npm ci && npm run bui
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 ```
 All five services come up and stay up across crashes and reboots. Ports:
-- `:8080` map + API · `:4174` analytics dashboard · `:8090/8091/8092` Go/Python/Rust
+- `:8088` map + API · `:4174` analytics dashboard · `:8090/8091/8092` Go/Python/Rust
 
 ## 6. The model trains itself
 `analytics-py` retrains every 6h from the growing ledger and hot-reloads with no

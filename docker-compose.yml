@@ -14,7 +14,12 @@ services:
       start_period: 10s
 
   analytics-py:
-    build: ./analytics-py
+    # Context is the repo root (not ./analytics-py) so the image can also copy
+    # shared/features.json, which featurize.py loads at startup. See the
+    # Dockerfile header for why.
+    build:
+      context: .
+      dockerfile: analytics-py/Dockerfile
     ports: ["8091:8091"]
     # Bind-mount ./data so the model reads the same ledger train_3d_map writes and
     # persists the trained model across restarts (MODEL_DIR). Without this the
@@ -45,7 +50,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.backend
-    ports: ["8080:8080"]
+    ports: ["8088:8088"]
     volumes:
       - ./data:/app/data
       - ./web/dist:/app/web/dist:ro
@@ -57,7 +62,7 @@ services:
       analytics-py:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8088/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 3

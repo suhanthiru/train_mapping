@@ -9,11 +9,11 @@
 # These path prefixes match dashboard/app.js's proxy-mode branching exactly
 # (see the comment there) — don't rename one without the other.
 
-# Live 3D map + its own API/WebSocket, all served by the backend on :8080.
+# Live 3D map + its own API/WebSocket, all served by the backend on :8088.
 # Single origin, so no path rewriting needed — web/src/main.ts already talks
 # same-origin (it derives HTTP/WS from location.host, not a hardcoded port).
 map.yourdomain.com {
-	reverse_proxy 127.0.0.1:8080
+	reverse_proxy 127.0.0.1:8088
 }
 
 # Analytics dashboard. Serves its own static assets at :4174, and proxies the
@@ -22,7 +22,7 @@ map.yourdomain.com {
 # blocking that would otherwise break a cross-port fetch from an https: page).
 analytics.yourdomain.com {
 	handle_path /api-backend/* {
-		reverse_proxy 127.0.0.1:8080
+		reverse_proxy 127.0.0.1:8088
 	}
 	handle_path /api-kalman/* {
 		reverse_proxy 127.0.0.1:8092

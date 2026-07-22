@@ -39,9 +39,9 @@ docker compose up --build
 ```
 
 Then visit:
-- **3D Map:** http://localhost:8080
+- **3D Map:** http://localhost:8088
 - **Analytics Dashboard:** http://localhost:4174
-- **Service Hub:** http://localhost:8080/hub
+- **Service Hub:** http://localhost:8088/hub
 
 Press Ctrl+C to stop.
 
@@ -93,17 +93,17 @@ cd web && npm run build && cd ..
 
 # 4. start EVERYTHING with one command (backend, analytics, kalman, dashboard, web dev)
 npm run dev:all
-# then open the service hub: http://localhost:8080/hub
+# then open the service hub: http://localhost:8088/hub
 ```
 
 `npm run dev:all` starts all five services with name-prefixed joined logs and
 stops the whole tree on Ctrl+C. The **service hub** at
-[localhost:8080/hub](http://localhost:8080/hub) shows a live health dot + link
+[localhost:8088/hub](http://localhost:8088/hub) shows a live health dot + link
 for each service — one bookmark instead of five ports:
 
 | Service | Port |
 |---|---|
-| Backend API + 3D map + hub/docs | 8080 |
+| Backend API + 3D map + hub/docs | 8088 |
 | Analytics API (FastAPI, models + anomaly) | 8091 |
 | Kalman sidecar (Rust) | 8092 |
 | Analytics dashboard | 4174 |

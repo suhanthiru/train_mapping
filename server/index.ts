@@ -2,7 +2,7 @@
 // vehicle state to all WebSocket clients, records history, and serves the
 // static geometry the frontend loads. PROJECT_SPEC.md §4.
 //
-// Run: npm run server   (PORT env optional, default 8080)
+// Run: npm run server   (PORT env optional, default 8088)
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
@@ -20,7 +20,7 @@ import { PORTS, nodeServiceUrls } from "../shared/config.ts";
 import { postJson, bridgeStatus } from "./bridge.ts";
 import type { VehicleState, RawVehicle } from "../shared/types.ts";
 
-const PORT = Number(process.env.PORT ?? PORTS.backend);
+const PORT = Number(process.env.PORT ?? PORTS.train_3d_map);
 const POLL_MS = 30_000; // how often we hit the live feed
 const PUSH_MS = 4_000; // how often we re-interpolate + broadcast fresh positions
 const WEATHER_MS = 5 * 60_000; // how often we sample the weather severity scalar
@@ -458,6 +458,25 @@ function logVehicleState(trains: VehicleState[], now: number): void {
   }
 }
 
+// Plain-English framing for a live anomaly: states that something's
+// happening right now, why (likely cause), and — the P4.1 addition — how
+// long it should take based on past episodes of the same (route, cause).
+// The ONE place duration stats become a sentence a non-technical rider can
+// act on; mirrors dashboard/app.js's Simple-mode phrasing convention.
+function anomalySummary(
+  a: ScoredAnomaly,
+  typical: { medianSec: number; n: number; scope: "route" | "cause" } | null
+): string {
+  const route = a.route_id ?? "a train";
+  const where = a.from_stop && a.to_stop ? ` near ${a.from_stop}→${a.to_stop}` : "";
+  const why = a.likely_cause?.cause ? ` — likely ${a.likely_cause.cause}` : "";
+  const base = `${route} is running slower than scheduled${where}${why}.`;
+  if (!typical) return `${base} Not enough similar past incidents yet to estimate how long this will take.`;
+  const mins = Math.max(1, Math.round(typical.medianSec / 60));
+  const basis = typical.scope === "route" ? `${typical.n} similar incidents on route ${route}` : `${typical.n} similar incidents (any route)`;
+  return `${base} Based on ${basis} in the last 30 days, this typically clears within ~${mins} min.`;
+}
+
 // P4: score in-progress hops against historical schedule baselines
 // (analytics-py /anomaly/hop — deviation vs scheduled hop time, alert
 // cross-reference, likely cause). Only hops slow enough to possibly flag are
@@ -479,15 +498,26 @@ async function anomalyTick(): Promise<void> {
         to_stop: hs.toStop, ts: now, observed_sec: observed,
       });
     }
-    if (!reqs.length) { currentAnomalies = new Map(); return; }
+    if (!reqs.length) {
+      currentAnomalies = new Map();
+      try { ledger.resolveAnomalies(new Set(), now); } // nothing tracked -> close everything open
+      catch (e) { console.error("[anomaly] resolve skipped:", (e as Error).message); }
+      return;
+    }
 
     const scored = await postJson<ScoredAnomaly[]>(
       `${ANALYTICS_PY}/anomaly/hop`, reqs, { name: "anomaly-hop" });
-    if (!scored) return; // warming / circuit open — keep previous set
+    if (!scored) return; // warming / circuit open — keep previous set, don't resolve (state unknown)
 
     const next = new Map<string, ScoredAnomaly>();
     for (const s of scored) if (s.is_anomaly) next.set(s.id, s);
     currentAnomalies = next;
+
+    // close out episodes that dropped off the active set this tick — that's
+    // what gives typicalDurationSec() real "how long did it take" samples.
+    const activeKeys = new Set([...next.values()].map((s) => `${s.id}|${s.to_stop ?? ""}`));
+    try { ledger.resolveAnomalies(activeKeys, now); }
+    catch (e) { console.error("[anomaly] resolve skipped:", (e as Error).message); }
 
     if (next.size) {
       const logged = ledger.recordAnomalies([...next.values()].map((s) => ({
@@ -556,7 +586,12 @@ const server = createServer(async (req, res) => {
   // history (anomalies_log). The dashboard's anomaly panel + ops row read this;
   // complementary to analytics-go :8090/anomalies (live headway bunching/gaps).
   if (url === "/api/anomalies") {
-    const current = [...currentAnomalies.values()];
+    const current = [...currentAnomalies.values()].map((a) => {
+      let typical: ReturnType<typeof ledger.typicalDurationSec> = null;
+      try { typical = ledger.typicalDurationSec(a.route_id, a.likely_cause?.cause ?? null); }
+      catch (e) { console.error("[anomaly] duration lookup failed:", (e as Error).message); }
+      return { ...a, typical_duration: typical, summary: anomalySummary(a, typical) };
+    });
     let recent: Record<string, unknown>[] = [];
     try { recent = ledger.recentAnomalies(); }
     catch (e) { console.error("[anomaly] recent query failed:", (e as Error).message); }

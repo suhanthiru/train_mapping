@@ -10,8 +10,11 @@ COPY ingest ./ingest
 COPY shared ./shared
 COPY history ./history
 COPY preprocess ./preprocess
+# docs/ holds the service hub (/hub) + architecture/explainer pages the server
+# serves from DOCS_DIR (/app/docs). Without this they 404 in the container.
+COPY docs ./docs
 COPY tsconfig.json ./
 ENV KALMAN_RS=http://kalman-rs:8092
 ENV ANALYTICS_PY=http://analytics-py:8091
-EXPOSE 8080
+EXPOSE 8088
 CMD ["npm", "run", "server"]

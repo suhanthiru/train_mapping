@@ -34,7 +34,7 @@ func env(k, d string) string {
 }
 
 var (
-	nodeWSURL = env("NODE_WS_URL", "ws://localhost:8080")
+	nodeWSURL = env("NODE_WS_URL", "ws://localhost:8088")
 	dataDir   = env("DATA_DIR", `D:\train_tracker\data\nyc`)
 	dbPath    = env("DB_PATH", `D:\train_tracker\data\analytics.db`)
 	httpAddr  = env("HTTP_ADDR", ":8090")

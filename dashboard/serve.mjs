@@ -1,5 +1,5 @@
 // Minimal static server for the analytics dashboard (:4174). Decoupled from the
-// 3D app — it fetches the live services (backend :8080, kalman :8092,
+// 3D app — it fetches the live services (backend :8088, kalman :8092,
 // analytics-py :8091) over CORS. Run: node dashboard/serve.mjs
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";

@@ -2,7 +2,7 @@
 // Regenerate with: npm run gen:config
 window.TT_CONFIG = {
   "ports": {
-    "train_3d_map": 8080,
+    "train_3d_map": 8088,
     "analyticsGo": 8090,
     "analyticsPy": 8091,
     "kalmanRs": 8092,

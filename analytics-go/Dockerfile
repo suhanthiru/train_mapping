@@ -8,7 +8,7 @@ RUN CGO_ENABLED=0 go build -o /out/analytics .
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /out/analytics /analytics
-ENV NODE_WS_URL=ws://train_3d_map:8080
+ENV NODE_WS_URL=ws://train_3d_map:8088
 ENV DATA_DIR=/data/nyc
 ENV DB_PATH=/data/analytics.db
 ENV PYTHON_URL=http://analytics-py:8091

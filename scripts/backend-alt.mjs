@@ -1,5 +1,5 @@
 // Launch the backend on an alternate port (default 8180) — lets a second
-// instance run for preview/verification while the primary holds :8080.
+// instance run for preview/verification while the primary holds :8088.
 // Used by .claude/launch.json ("backend-alt").
 import { spawn } from "node:child_process";
 import { join } from "node:path";

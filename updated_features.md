@@ -41,7 +41,7 @@ cross-references real Service-Alert history (verified against an actual
 - `npm run dev:all` (`scripts/dev-all.mjs`, zero new deps): starts kalman-rs,
   analytics-py, backend, dashboard, and vite together with prefixed logs and
   tree-kill on Ctrl+C (Windows `taskkill /T`).
-- Service hub at `:8080/hub` — live health dots + links for all five services.
+- Service hub at `:8088/hub` — live health dots + links for all five services.
 - Recreated `docs/architecture.html` (current system diagram incl. pretrain +
   anomaly) and `docs/explainer.html` (plain-words tour), served by the backend.
 - Standing rule going forward: these pages + README get refreshed at the end of
